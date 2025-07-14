@@ -1,0 +1,21 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "npm: compile",
+      "type": "npm",
+      "script": "compile",
+      "group": {
+        "kind": "build",
+        "isDefault": true          // <-- lets ${defaultBuildTask} work too
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "npm: watch",       // optional, keep if you like live-reload
+      "type": "npm",
+      "script": "watch",
+      "problemMatcher": []
+    }
+  ]
+}
