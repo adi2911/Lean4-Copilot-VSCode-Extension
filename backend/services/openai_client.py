@@ -1,7 +1,17 @@
 import os
 import openai
 
+from dotenv import load_dotenv
 
+
+# Load variables from .env into the environment
+load_dotenv()
+
+# Access them using os.getenv or os.environ
+api_key = os.getenv("OPENAI_API_KEY")  
+
+openai.api_key = api_key
+print(api_key)
 async def stream_completion(prompt: str, max_tokens: int = 256):
     response = await openai.ChatCompletion.acreate(
         model="gpt-4o",
