@@ -44,7 +44,9 @@ async function postJSON(url, body) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body)
   });
-  if (!res.ok) throw new Error(`Backend error ${res.status}`);
+  if (!res.ok) {
+    throw new Error(`Backend error ${res.status}`);
+  }
   return res.json();
 }
 async function completeProof(fileText, cursorLine, cursorCol, maxTokens = 512) {
@@ -61,6 +63,57 @@ async function retryProof(fileText, errorLog, userNote) {
     error_log: errorLog,
     user_note: userNote ?? null
   });
+}
+async function callLLMCompletion(fileText, line, col, maxTokens = 128) {
+  console.log(">>>>> I was called", fileText);
+  const payload = {
+    file_text: fileText,
+    cursor_line: line,
+    cursor_col: col,
+    max_tokens: maxTokens
+  };
+  const res = await fetch(`${BASE_URL}/complete`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+  console.log(">>>> response received ", res.body);
+  if (!res.ok || !res.body) {
+    throw new Error("backend /complete failed");
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let out = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) {
+      break;
+    }
+    out += decoder.decode(value);
+    if (out.includes("[[END]]")) {
+      break;
+    }
+  }
+  return out.replace("[[END]]", "");
+}
+async function validateWithLean(fullFile) {
+  const res = await fetch(`${BASE_URL}/validate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ file_text: fullFile })
+  });
+  console.log(">>>> validation received", res.body);
+  if (!res.ok) {
+    throw new Error("backend /validate failed");
+  }
+  return await res.json();
+}
+
+// src/CleanSuggestion.ts
+function cleanSuggestion(raw) {
+  raw = raw.replace(/^```.*?\n?/s, "");
+  raw = raw.replace(/\n?```$/s, "");
+  return raw;
 }
 
 // src/ui/ErrorPanel.ts
@@ -231,6 +284,43 @@ function activate(ctx) {
       }
       await runCompletion(ed);
     })
+  );
+  const provider = {
+    async provideInlineCompletionItems(document, position, context, _token) {
+      console.log(">>>>>>> vscode.InlineCompletionItemProvider");
+      await new Promise((r) => setTimeout(r, 300));
+      const fileText = document.getText();
+      const suggestionRaw = await callLLMCompletion(
+        fileText,
+        position.line + 1,
+        position.character + 1,
+        128
+      );
+      console.log(">>>> received the suggestion moving to cleaning process");
+      let suggestion = cleanSuggestion(suggestionRaw);
+      console.log(">>>> clean suggestion : ", suggestion);
+      if (!suggestion.startsWith("\n")) {
+        suggestion = "\n  " + suggestion.trimStart();
+      }
+      if (!suggestion.trim()) return { items: [] };
+      console.log(">>>> Moving to validating the response");
+      const okResp = await validateWithLean(
+        fileText.slice(0, document.offsetAt(position)) + suggestion + fileText.slice(document.offsetAt(position))
+      );
+      if (!okResp.ok) return { items: [] };
+      console.log(`>>>>>> verification done ,Showing suggestion ${position}`);
+      const item = new vscode2.InlineCompletionItem(
+        suggestion,
+        new vscode2.Range(position, position)
+      );
+      return { items: [item] };
+    }
+  };
+  ctx.subscriptions.push(
+    vscode2.languages.registerInlineCompletionItemProvider(
+      { language: "lean4" },
+      provider
+    )
   );
   ctx.subscriptions.push(
     vscode2.commands.registerCommand("lean4Copilot.inlineSuggest", async () => {

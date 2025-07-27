@@ -1,5 +1,12 @@
 import * as vscode from "vscode";
-import { completeProof, CompletionResponse, retryProof } from "./api";
+import {
+  callLLMCompletion,
+  completeProof,
+  CompletionResponse,
+  retryProof,
+  validateWithLean,
+} from "./api";
+import { cleanSuggestion } from "./CleanSuggestion";
 import { ErrorPanel } from "./ui/ErrorPanel";
 
 /* ───────────────────────── Inline-ghost provider ────────────────────────── */
@@ -65,7 +72,6 @@ export function activate(ctx: vscode.ExtensionContext) {
     )
   );
 
-  /* COMMAND ❶ – old diff/replace flow */
   ctx.subscriptions.push(
     vscode.commands.registerCommand("lean4Copilot.completeProof", async () => {
       const ed = vscode.window.activeTextEditor;
@@ -77,7 +83,65 @@ export function activate(ctx: vscode.ExtensionContext) {
     })
   );
 
-  /* COMMAND ❷ – ghost-suggest flow */
+  const provider: vscode.InlineCompletionItemProvider = {
+    async provideInlineCompletionItems(
+      document,
+      position,
+      context,
+      _token
+    ): Promise<vscode.InlineCompletionList> {
+      console.log(">>>>>>> vscode.InlineCompletionItemProvider");
+
+      // Debounce at 300 ms
+      await new Promise((r) => setTimeout(r, 300));
+
+      const fileText = document.getText();
+
+      const suggestionRaw = await callLLMCompletion(
+        fileText,
+        position.line + 1,
+        position.character + 1,
+        128
+      );
+      console.log(">>>> received the suggestion moving to cleaning process");
+      let suggestion = cleanSuggestion(suggestionRaw);
+      console.log(">>>> clean suggestion : ", suggestion);
+
+      if (!suggestion.startsWith("\n")) {
+        suggestion = "\n  " + suggestion.trimStart();
+      }
+
+      // quick pre-check to avoid obvious junk
+      if (!suggestion.trim()) return { items: [] };
+
+      // validate before showing
+
+      console.log(">>>> Moving to validating the response");
+      const okResp = await validateWithLean(
+        fileText.slice(0, document.offsetAt(position)) +
+          suggestion +
+          fileText.slice(document.offsetAt(position))
+      );
+      if (!okResp.ok) return { items: [] };
+
+      console.log(`>>>>>> verification done ,Showing suggestion ${position}`);
+      // VS Code shows it as greyed ghost text
+      const item = new vscode.InlineCompletionItem(
+        suggestion,
+        new vscode.Range(position, position)
+      );
+      return { items: [item] };
+    },
+  };
+
+  // register provider for Lean files
+  ctx.subscriptions.push(
+    vscode.languages.registerInlineCompletionItemProvider(
+      { language: "lean4" },
+      provider
+    )
+  );
+
   ctx.subscriptions.push(
     vscode.commands.registerCommand("lean4Copilot.inlineSuggest", async () => {
       // If user disabled inlineSuggest, tip them & bail out

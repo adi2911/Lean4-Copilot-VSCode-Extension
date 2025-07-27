@@ -10,7 +10,8 @@
     "Other"
   ],
   "activationEvents": [
-    "onCommand:lean4Copilot.completeProof"
+    "onCommand:lean4Copilot.completeProof",
+    "onLanguage:lean4"
   ],
   "main": "./dist/extension.js",
   "contributes": {

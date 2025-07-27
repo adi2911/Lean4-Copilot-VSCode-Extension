@@ -6,7 +6,6 @@ class CompletionRequest(BaseModel):
     file_text: str
     cursor_line: int
     cursor_col: int
-    max_tokens: int = 256
 
 class CompletionChunk(BaseModel):
     text: str
@@ -18,7 +17,7 @@ class ValidationRequest(BaseModel):
 
 class ValidationResponse(BaseModel):
     ok: bool
-    log: str
+    log: str | None = None
 
 
 class CompletionResponse(BaseModel):

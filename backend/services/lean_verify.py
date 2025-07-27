@@ -12,7 +12,7 @@ async def verify_lean_code(file_text: str) -> tuple[bool, str]:
         with open(file_path, "w") as f:
             f.write(file_text)
 
-        print(f" file text {file_text}")
+        print(f">>>>>> file text received at lean verification {file_text}")
         # Run lean on the file
         proc = await asyncio.create_subprocess_exec(
             "lean",
@@ -22,7 +22,7 @@ async def verify_lean_code(file_text: str) -> tuple[bool, str]:
         )
 
         stdout, stderr = await proc.communicate()
-        print(f"{stdout} and the error is : {stderr}")
+        print(f">>>>> the output from verification : {stdout} \n and the error is : {stderr}")
         ok = proc.returncode == 0
         log = stderr.decode() if not ok else stdout.decode()
 

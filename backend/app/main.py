@@ -1,57 +1,101 @@
-from typing import List, Optional
+# backend/app/main.py
+from __future__ import annotations
 
+import asyncio
 from fastapi import FastAPI, HTTPException
-from app.schemas import CompletionRequest, RetryRequest, CompletionResponse
-from services.prompt_builder import make_prompt
-from services.prompt_retry_builder import make_retry_prompt
-from services.openai_client import chat_completion
-from services.lean_verify import verify_lean_code
+from fastapi.responses import StreamingResponse
 
+# ── local modules ─────────────────────────────────────────────────────────────
+from app.schemas import (
+    CompletionRequest,
+    CompletionResponse,
+    RetryRequest,
+    ValidationRequest,
+    ValidationResponse,
+)
+from services.prompt_retry_builder import make_retry_prompt, resilient_invoke  # retry logic
+from services.lean_verify import verify_lean_code                     # ↔ lean --run
+
+# ── FastAPI app ───────────────────────────────────────────────────────────────
 app = FastAPI()
 
-# ── helpers ────────────────────────────────────────────────────────────────
-def splice(src: str, snippet: str, line: int, col: int) -> str:
-    lines = src.splitlines()
-    if line >= len(lines):
-        raise HTTPException(status_code=400, detail="Cursor line OOB")
-    lines[line] = lines[line][:col] + snippet + lines[line][col:]
-    return "\n".join(lines)
 
-
-def strip_fences(txt: str) -> str:
-    return txt.replace("```lean", "").replace("```", "").strip()
-
-
-# ── /complete ──────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
+#  /complete  ── ghost-text / “Complete proof” entry point
+# ------------------------------------------------------------------------------
 @app.post("/complete", response_model=CompletionResponse)
-async def complete(req: CompletionRequest) -> CompletionResponse:
-    # 0. Fast path – file already valid?  (F-3)
-    ok, _ = await verify_lean_code(req.file_text)
-    if ok:
-        return CompletionResponse(ok=True, code=req.file_text, log="")
+async def complete(req: CompletionRequest):
+    """
+    1. Build the vars dict the pipeline expects.
+    2. Ask the LLM(s) for a suggestion (resilient_invoke includes retries).
+    3. Stream the answer with the sentinel `[[END]]` the front-end splits on.
+    """
+    vars_ = {
+        "file_text": req.file_text,
+        "line": req.cursor_line,
+        "col": req.cursor_col,
+    }
 
-    # 1. ask LLM
-    prompt_plain = make_prompt(req.file_text, req.cursor_line, req.cursor_col)
-    msgs = [
-        {
-            "role": "system",
-            "content": "You are an expert Lean4 assistant. "
-            "Return ONLY Lean code that completes the proof.",
-        },
-        {"role": "user", "content": prompt_plain},
-    ]
-    snippet = strip_fences(await chat_completion(msgs, max_tokens=req.max_tokens))
+    print(f">>>>> triggered suggestion building")
 
-    # 2. splice & validate
-    candidate = splice(req.file_text, snippet, req.cursor_line, req.cursor_col)
-    ok, log = await verify_lean_code(candidate)
-    return CompletionResponse(ok=ok, code=candidate, log=log)
+    # resilient_invoke already wraps generate_suggestion with tenacity.
+    suggestion: str = await resilient_invoke(vars_)
+
+    print(f">>>>>> Receieved suggestion at the endpoint ,method : {suggestion}")
+
+    async def stream():
+        yield suggestion
+        yield "\n[[END]]"
+
+    # VS Code extension consumes plain-text chunks
+    return StreamingResponse(stream(), media_type="text/plain")
 
 
-# ── /retry ─────────────────────────────────────────────────────────────────
+
+@app.post("/validate", response_model=ValidationResponse)
+async def validate(req: ValidationRequest):
+    print(">>> validate endpoint is call to verify lean code")
+    ok, err = await verify_lean_code(req.file_text)
+    # `err` is raw stderr bytes from `lake exe lean …` (may be None)
+    return {"ok": ok, "log": err.decode() if err else None}
+
+
+# ------------------------------------------------------------------------------
+#  /retry  ── user clicked “Retry” (or supplied a note) after a failed proof
+# ------------------------------------------------------------------------------
 @app.post("/retry", response_model=CompletionResponse)
-async def retry(req: RetryRequest) -> CompletionResponse:
-    msgs = make_retry_prompt(req.file_text, req.error_log, req.user_note)
-    fixed = strip_fences(await chat_completion(msgs))
-    ok, log = await verify_lean_code(fixed)
-    return CompletionResponse(ok=ok, code=fixed, log=log)
+async def retry(req: RetryRequest):
+    """
+    Build a specialised prompt that shows:
+      • the current file,
+      • the Lean error log,
+      • the user’s note (optional).
+    The LLM returns a *replacement* fragment; we re-validate it.
+    """
+    messages = make_retry_prompt(
+        file_text=req.file_text,
+        error_log=req.error_log,
+        user_note=req.user_note or "",
+    )
+
+    # Direct OpenAI chat call wrapped in helper; returns *raw* code block(s)
+    from openai_client import chat_completion, strip_fences
+
+    raw_fix = await chat_completion(messages)
+    fix = strip_fences(raw_fix)
+
+    ok, err = await verify_lean_code(fix)
+
+    return {
+        "completion": fix,
+        "ok": ok,
+        "log": err.decode() if err else None,
+    }
+
+
+# ------------------------------------------------------------------------------
+#  Ready!
+# ------------------------------------------------------------------------------
+@app.get("/")
+async def root():
+    return {"status": "lean-copilot backend up ✨"}

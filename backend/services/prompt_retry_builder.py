@@ -1,4 +1,6 @@
 from typing import Optional
+from services.langchain_pipeline import generate_suggestion
+from tenacity import retry, wait_random_exponential, stop_after_attempt
 
 SYSTEM_MSG = (
     "You are an expert Lean4 assistant. "
@@ -17,3 +19,9 @@ def make_retry_prompt(file_text: str, error_log: str, user_hint: Optional[str]) 
         msgs.append({"role": "user", "content": "Extra hint from user:\n" + user_hint})
     msgs.append({"role": "system", "content": "Please output the FULL corrected file."})
     return msgs
+
+
+
+@retry(wait=wait_random_exponential(min=1, max=3), stop=stop_after_attempt(3))
+async def resilient_invoke(vars: dict) -> str:
+    return await generate_suggestion(vars)
