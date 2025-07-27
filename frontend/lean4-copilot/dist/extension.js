@@ -109,9 +109,6 @@ var ErrorPanel = class _ErrorPanel {
   onDidDispose(cb) {
     this.panel.onDidDispose(cb);
   }
-  /* ---------------------------------------------------------------------- *
-   *  HTML                                                                  *
-   * ---------------------------------------------------------------------- */
   buildHtml(errorLog) {
     const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
     const escapedLog = esc(errorLog);
@@ -128,27 +125,21 @@ var ErrorPanel = class _ErrorPanel {
     pre {
       background: var(--vscode-editor-background);
       color: var(--vscode-editor-foreground);
-      padding: 1rem;
-      border-radius: 6px;
-      overflow-x: auto;
-      white-space: pre-wrap;
+      padding: 1rem; border-radius: 6px;
+      overflow-x: auto; white-space: pre-wrap;
     }
     textarea {
-      width: 100%; height: 5rem;
-      margin-top: 0.5rem;
-      border-radius: 4px;
-      padding: 0.5rem;
+      width: 100%; height: 5rem; margin-top: .5rem;
+      border-radius: 4px; padding: .5rem;
       font-family: var(--vscode-editor-font-family);
       background: var(--vscode-input-background);
       color: var(--vscode-input-foreground);
       border: 1px solid var(--vscode-input-border);
     }
-    .btn-group { margin-top: 1rem; display: flex; gap: 0.5rem; }
+    .btn-group { margin-top: 1rem; display: flex; gap: .5rem; }
     button {
-      padding: 0.4rem 1rem;
-      border: none; border-radius: 4px;
-      cursor: pointer;
-      font-weight: 500;
+      padding: .4rem 1rem; border: none; border-radius: 4px;
+      cursor: pointer; font-weight: 500;
     }
     .retry { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
     .close { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
@@ -156,11 +147,14 @@ var ErrorPanel = class _ErrorPanel {
 </head>
 <body>
   <div class="container">
-    <h3>Lean validation failed</h3>
+    <h3>Lean verification failed</h3>
+    <p>The generated code does not compile.  
+       Add an optional hint below or press <b>Retry</b> to try again.</p>
+
     <pre id="lean-log">${escapedLog}</pre>
 
-    <label for="hint">Optional hint for the AI:</label>
-    <textarea id="hint" placeholder="e.g. \u2018I suspect the induction step is wrong\u2019"></textarea>
+    <label for="hint">Hint for the AI (optional):</label>
+    <textarea id="hint" placeholder="e.g. \u2018Induction step is wrong\u2019"></textarea>
 
     <div class="btn-group">
       <button id="retry" class="retry">Retry</button>
@@ -170,7 +164,6 @@ var ErrorPanel = class _ErrorPanel {
 
   <script>
     const vscode = acquireVsCodeApi();
-
     document.getElementById('retry').addEventListener('click', () => {
       const hint = document.getElementById('hint').value.trim();
       vscode.postMessage({ command: 'retry', userHint: hint });
@@ -178,12 +171,10 @@ var ErrorPanel = class _ErrorPanel {
     document.getElementById('close').addEventListener('click', () => {
       vscode.postMessage({ command: 'close' });
     });
-
-    /* Handle updates from extension host */
+    /* live updates */
     window.addEventListener('message', (event) => {
-      const msg = event.data;
-      if (msg.command === 'updateLog') {
-        document.getElementById('lean-log').textContent = msg.log;
+      if (event.data.command === 'updateLog') {
+        document.getElementById('lean-log').textContent = event.data.log;
       }
     });
   </script>
@@ -194,24 +185,70 @@ var ErrorPanel = class _ErrorPanel {
 };
 
 // src/extension.ts
-function activate(context) {
-  const cmd = vscode2.commands.registerCommand(
-    "lean4Copilot.completeProof",
-    async () => {
+var LeanInlineProvider = class {
+  async provideInlineCompletionItems(doc, pos, _ctx, token) {
+    let res;
+    try {
+      res = await completeProof(doc.getText(), pos.line, pos.character);
+    } catch (e) {
+      console.error("[Lean4-Copilot] backend error:", e);
+      return { items: [] };
+    }
+    if (token.isCancellationRequested) return { items: [] };
+    if (res.ok) {
+      const tail = extractTail(doc.getText(), res.code, doc.offsetAt(pos));
+      return tail.trim() ? { items: [new vscode2.InlineCompletionItem(tail)] } : { items: [] };
+    }
+    const ed = vscode2.window.activeTextEditor;
+    if (ed) await handle(res, ed);
+    return { items: [] };
+  }
+};
+function extractTail(original, candidate, cursorIdx) {
+  if (candidate.length > cursorIdx && candidate.startsWith(original.slice(0, cursorIdx))) {
+    return candidate.slice(cursorIdx);
+  }
+  return "";
+}
+function activate(ctx) {
+  console.log("Lean4 Copilot activated \u2705");
+  const selector = [
+    { language: "lean4", scheme: "file" },
+    { language: "lean", scheme: "file" }
+  ];
+  ctx.subscriptions.push(
+    vscode2.languages.registerInlineCompletionItemProvider(
+      selector,
+      new LeanInlineProvider()
+    )
+  );
+  ctx.subscriptions.push(
+    vscode2.commands.registerCommand("lean4Copilot.completeProof", async () => {
       const ed = vscode2.window.activeTextEditor;
       if (!ed) {
         vscode2.window.showErrorMessage("No active editor");
         return;
       }
       await runCompletion(ed);
-    }
+    })
   );
-  context.subscriptions.push(cmd);
+  ctx.subscriptions.push(
+    vscode2.commands.registerCommand("lean4Copilot.inlineSuggest", async () => {
+      const inlineEnabled = vscode2.workspace.getConfiguration("editor").get("inlineSuggest.enabled", false);
+      if (!inlineEnabled) {
+        vscode2.window.showWarningMessage(
+          "Enable Settings \u203A Editor \u203A Inline Suggest to see ghost completions."
+        );
+        return;
+      }
+      await vscode2.commands.executeCommand(
+        "editor.action.inlineSuggest.trigger"
+      );
+    })
+  );
 }
 function deactivate() {
 }
-var errorPanel;
-var diffDoc;
 async function runCompletion(editor) {
   const { document, selection } = editor;
   try {
@@ -225,6 +262,8 @@ async function runCompletion(editor) {
     vscode2.window.showErrorMessage(`Completion failed: ${e.message ?? e}`);
   }
 }
+var errorPanel;
+var diffDoc;
 async function handle(res, editor) {
   if (res.ok) {
     await showDiffAndApply(res.code, editor);
@@ -242,7 +281,6 @@ async function handle(res, editor) {
     try {
       const newRes = await retryProof(
         res.code,
-        // latest failing file
         res.log,
         userHint && userHint.trim() ? userHint : void 0
       );
@@ -252,20 +290,18 @@ async function handle(res, editor) {
     }
   }
 }
-async function showDiffAndApply(fixedContent, editor) {
-  if (fixedContent === editor.document.getText()) {
-    vscode2.window.showInformationMessage(
-      "Lean proof already correct \u2014 nothing to apply."
-    );
+async function showDiffAndApply(fixed, editor) {
+  if (fixed === editor.document.getText()) {
+    vscode2.window.showInformationMessage("Nothing to apply \u2013 proof already OK");
     return;
   }
-  if (diffDoc) {
-    await vscode2.workspace.applyEdit(await replaceAll(diffDoc, fixedContent));
-  } else {
+  if (!diffDoc) {
     diffDoc = await vscode2.workspace.openTextDocument({
       language: editor.document.languageId,
-      content: fixedContent
+      content: fixed
     });
+  } else {
+    await vscode2.workspace.applyEdit(await replaceAll(diffDoc, fixed));
   }
   await vscode2.commands.executeCommand(
     "vscode.diff",
@@ -275,25 +311,20 @@ async function showDiffAndApply(fixedContent, editor) {
     { preview: false }
   );
   const choice = await vscode2.window.showInformationMessage(
-    "Proof verified \u2013 apply the proposed fix?",
+    "Apply the verified proof?",
     { modal: false },
     "Apply \u2714\uFE0E",
     "Discard \u2716\uFE0E"
   );
   if (choice === "Apply \u2714\uFE0E") {
-    await editor.edit(
-      (e) => e.replace(fullRange(editor.document), fixedContent)
-    );
+    await editor.edit((e) => e.replace(fullRange(editor.document), fixed));
     vscode2.window.setStatusBarMessage("\u2705 Proof applied", 2500);
-  } else if (choice === "Discard \u2716\uFE0E") {
-    vscode2.commands.executeCommand("workbench.action.closeActiveEditor");
   }
+  await vscode2.commands.executeCommand("workbench.action.closeActiveEditor");
+  diffDoc = void 0;
 }
 function closeErrorPanel() {
-  if (errorPanel) {
-    errorPanel.dispose();
-    errorPanel = void 0;
-  }
+  if (errorPanel) errorPanel.dispose();
 }
 function fullRange(doc) {
   return new vscode2.Range(

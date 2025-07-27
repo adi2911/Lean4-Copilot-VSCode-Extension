@@ -14,12 +14,10 @@
   ],
   "main": "./dist/extension.js",
   "contributes": {
-   "commands": [
-    {
-      "command": "lean4Copilot.completeProof",
-      "title": "Lean4: Complete Proof with LLM"
-    }
-  ]
+  "commands": [
+  { "command": "lean4Copilot.completeProof", "title": "Lean4 Copilot: Complete Proof" },
+  { "command": "lean4Copilot.inlineSuggest", "title": "Lean4 Copilot: Ghost Suggest" }
+]
   },
   "scripts": {
     "vscode:prepublish": "npm run package",

@@ -2,28 +2,104 @@ import * as vscode from "vscode";
 import { completeProof, CompletionResponse, retryProof } from "./api";
 import { ErrorPanel } from "./ui/ErrorPanel";
 
-/* ───────────────────────── Activation ─────────────────────────────────── */
-export function activate(context: vscode.ExtensionContext) {
-  const cmd = vscode.commands.registerCommand(
-    "lean4Copilot.completeProof",
-    async () => {
+/* ───────────────────────── Inline-ghost provider ────────────────────────── */
+class LeanInlineProvider implements vscode.InlineCompletionItemProvider {
+  async provideInlineCompletionItems(
+    doc: vscode.TextDocument,
+    pos: vscode.Position,
+    _ctx: vscode.InlineCompletionContext,
+    token: vscode.CancellationToken
+  ): Promise<vscode.InlineCompletionList> {
+    let res: CompletionResponse;
+    try {
+      res = await completeProof(doc.getText(), pos.line, pos.character);
+    } catch (e: any) {
+      console.error("[Lean4-Copilot] backend error:", e);
+      return { items: [] };
+    }
+    if (token.isCancellationRequested) return { items: [] };
+
+    /* 1. happy path → ghost text */
+    if (res.ok) {
+      const tail = extractTail(doc.getText(), res.code, doc.offsetAt(pos));
+      return tail.trim()
+        ? { items: [new vscode.InlineCompletionItem(tail)] }
+        : { items: [] };
+    }
+
+    /* 2. compilation failed → error panel */
+    const ed = vscode.window.activeTextEditor;
+    if (ed) await handle(res, ed);
+    return { items: [] };
+  }
+}
+
+/* heuristic: keep only new suffix */
+function extractTail(
+  original: string,
+  candidate: string,
+  cursorIdx: number
+): string {
+  if (
+    candidate.length > cursorIdx &&
+    candidate.startsWith(original.slice(0, cursorIdx))
+  ) {
+    return candidate.slice(cursorIdx);
+  }
+  return "";
+}
+
+/* ───────────────────────── Activation ───────────────────────────────────── */
+export function activate(ctx: vscode.ExtensionContext) {
+  console.log("Lean4 Copilot activated ✅");
+
+  /* register provider for Lean3+Lean4 */
+  const selector: vscode.DocumentSelector = [
+    { language: "lean4", scheme: "file" },
+    { language: "lean", scheme: "file" },
+  ];
+  ctx.subscriptions.push(
+    vscode.languages.registerInlineCompletionItemProvider(
+      selector,
+      new LeanInlineProvider()
+    )
+  );
+
+  /* COMMAND ❶ – old diff/replace flow */
+  ctx.subscriptions.push(
+    vscode.commands.registerCommand("lean4Copilot.completeProof", async () => {
       const ed = vscode.window.activeTextEditor;
       if (!ed) {
         vscode.window.showErrorMessage("No active editor");
         return;
       }
       await runCompletion(ed);
-    }
+    })
   );
-  context.subscriptions.push(cmd);
+
+  /* COMMAND ❷ – ghost-suggest flow */
+  ctx.subscriptions.push(
+    vscode.commands.registerCommand("lean4Copilot.inlineSuggest", async () => {
+      // If user disabled inlineSuggest, tip them & bail out
+      const inlineEnabled = vscode.workspace
+        .getConfiguration("editor")
+        .get<boolean>("inlineSuggest.enabled", false);
+
+      if (!inlineEnabled) {
+        vscode.window.showWarningMessage(
+          "Enable Settings › Editor › Inline Suggest to see ghost completions."
+        );
+        return;
+      }
+      await vscode.commands.executeCommand(
+        "editor.action.inlineSuggest.trigger"
+      );
+    })
+  );
 }
 export function deactivate() {}
 
-/* ───────────────────────── Globals ─────────────────────────────────────── */
-let errorPanel: ErrorPanel | undefined;
-let diffDoc: vscode.TextDocument | undefined;
-
-/* ───────────────────────── Main flow  ──────────────────────────────────── */
+/* ───────────────────────── Diff-view completion (old path) ─────────────── */
 async function runCompletion(editor: vscode.TextEditor) {
   const { document, selection } = editor;
   try {
@@ -38,15 +114,19 @@ async function runCompletion(editor: vscode.TextEditor) {
   }
 }
 
+/* ───────────────────────── Shared error / diff logic ───────────────────── */
+let errorPanel: ErrorPanel | undefined;
+let diffDoc: vscode.TextDocument | undefined;
+
 async function handle(res: CompletionResponse, editor: vscode.TextEditor) {
-  /* success → diff view --------------------------------------------------- */
+  /* success → diff-view */
   if (res.ok) {
     await showDiffAndApply(res.code, editor);
     closeErrorPanel();
     return;
   }
 
-  /* failure → singleton ErrorPanel --------------------------------------- */
+  /* failure → singleton ErrorPanel */
   if (!errorPanel) {
     errorPanel = ErrorPanel.create(res.log, retryWithHint);
     errorPanel.onDidDispose(() => (errorPanel = undefined));
@@ -55,11 +135,10 @@ async function handle(res: CompletionResponse, editor: vscode.TextEditor) {
     errorPanel.reveal();
   }
 
-  /* nested helper --------------------------------------------------------- */
   async function retryWithHint({ userHint }: { userHint: string | null }) {
     try {
       const newRes = await retryProof(
-        res.code, // latest failing file
+        res.code,
         res.log,
         userHint && userHint.trim() ? userHint : undefined
       );
@@ -70,33 +149,23 @@ async function handle(res: CompletionResponse, editor: vscode.TextEditor) {
   }
 }
 
-/* ───────────────────────── Diff + Apply UX ─────────────────────────────── */
-/* ---------------------------------------------------------------------- */
-/*  Diff view with toolbar buttons                                        */
-/* ---------------------------------------------------------------------- */
-async function showDiffAndApply(
-  fixedContent: string,
-  editor: vscode.TextEditor
-) {
-  /* 0. If no change, short-circuit */
-  if (fixedContent === editor.document.getText()) {
-    vscode.window.showInformationMessage(
-      "Lean proof already correct — nothing to apply."
-    );
+/* ───────────────────────── Diff helpers ────────────────────────────────── */
+async function showDiffAndApply(fixed: string, editor: vscode.TextEditor) {
+  if (fixed === editor.document.getText()) {
+    vscode.window.showInformationMessage("Nothing to apply – proof already OK");
     return;
   }
 
-  /* 1. Create / update RHS “proposed fix” doc (singleton) */
-  if (diffDoc) {
-    await vscode.workspace.applyEdit(await replaceAll(diffDoc, fixedContent));
-  } else {
+  /* open / refresh diff doc */
+  if (!diffDoc) {
     diffDoc = await vscode.workspace.openTextDocument({
       language: editor.document.languageId,
-      content: fixedContent,
+      content: fixed,
     });
+  } else {
+    await vscode.workspace.applyEdit(await replaceAll(diffDoc, fixed));
   }
 
-  /* 2. Open diff and add custom toolbar buttons via context-key */
   await vscode.commands.executeCommand(
     "vscode.diff",
     editor.document.uri,
@@ -105,39 +174,32 @@ async function showDiffAndApply(
     { preview: false }
   );
 
-  /* 3. Show Apply / Discard buttons */
   const choice = await vscode.window.showInformationMessage(
-    "Proof verified – apply the proposed fix?",
+    "Apply the verified proof?",
     { modal: false },
     "Apply ✔︎",
     "Discard ✖︎"
   );
 
   if (choice === "Apply ✔︎") {
-    await editor.edit((e) =>
-      e.replace(fullRange(editor.document), fixedContent)
-    );
+    await editor.edit((e) => e.replace(fullRange(editor.document), fixed));
     vscode.window.setStatusBarMessage("✅ Proof applied", 2500);
-  } else if (choice === "Discard ✖︎") {
-    vscode.commands.executeCommand("workbench.action.closeActiveEditor");
   }
+
+  /* Close the diff tab in both cases */
+  await vscode.commands.executeCommand("workbench.action.closeActiveEditor");
+  diffDoc = undefined; // reset handle
 }
 
-/* ───────────────────────── Utilities ───────────────────────────────────── */
 function closeErrorPanel() {
-  if (errorPanel) {
-    errorPanel.dispose();
-    errorPanel = undefined;
-  }
+  if (errorPanel) errorPanel.dispose();
 }
-
 function fullRange(doc: vscode.TextDocument) {
   return new vscode.Range(
     doc.positionAt(0),
     doc.positionAt(doc.getText().length)
   );
 }
-
 async function replaceAll(doc: vscode.TextDocument, newText: string) {
   const edit = new vscode.WorkspaceEdit();
   edit.replace(doc.uri, fullRange(doc), newText);

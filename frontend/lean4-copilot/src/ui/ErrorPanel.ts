@@ -59,9 +59,6 @@ export class ErrorPanel {
     this.panel.onDidDispose(cb);
   }
 
-  /* ---------------------------------------------------------------------- *
-   *  HTML                                                                  *
-   * ---------------------------------------------------------------------- */
   private buildHtml(errorLog: string): string {
     const esc = (s: string) =>
       s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -78,27 +75,21 @@ export class ErrorPanel {
     pre {
       background: var(--vscode-editor-background);
       color: var(--vscode-editor-foreground);
-      padding: 1rem;
-      border-radius: 6px;
-      overflow-x: auto;
-      white-space: pre-wrap;
+      padding: 1rem; border-radius: 6px;
+      overflow-x: auto; white-space: pre-wrap;
     }
     textarea {
-      width: 100%; height: 5rem;
-      margin-top: 0.5rem;
-      border-radius: 4px;
-      padding: 0.5rem;
+      width: 100%; height: 5rem; margin-top: .5rem;
+      border-radius: 4px; padding: .5rem;
       font-family: var(--vscode-editor-font-family);
       background: var(--vscode-input-background);
       color: var(--vscode-input-foreground);
       border: 1px solid var(--vscode-input-border);
     }
-    .btn-group { margin-top: 1rem; display: flex; gap: 0.5rem; }
+    .btn-group { margin-top: 1rem; display: flex; gap: .5rem; }
     button {
-      padding: 0.4rem 1rem;
-      border: none; border-radius: 4px;
-      cursor: pointer;
-      font-weight: 500;
+      padding: .4rem 1rem; border: none; border-radius: 4px;
+      cursor: pointer; font-weight: 500;
     }
     .retry { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
     .close { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
@@ -106,11 +97,14 @@ export class ErrorPanel {
 </head>
 <body>
   <div class="container">
-    <h3>Lean validation failed</h3>
+    <h3>Lean verification failed</h3>
+    <p>The generated code does not compile.  
+       Add an optional hint below or press <b>Retry</b> to try again.</p>
+
     <pre id="lean-log">${escapedLog}</pre>
 
-    <label for="hint">Optional hint for the AI:</label>
-    <textarea id="hint" placeholder="e.g. ‘I suspect the induction step is wrong’"></textarea>
+    <label for="hint">Hint for the AI (optional):</label>
+    <textarea id="hint" placeholder="e.g. ‘Induction step is wrong’"></textarea>
 
     <div class="btn-group">
       <button id="retry" class="retry">Retry</button>
@@ -120,7 +114,6 @@ export class ErrorPanel {
 
   <script>
     const vscode = acquireVsCodeApi();
-
     document.getElementById('retry').addEventListener('click', () => {
       const hint = document.getElementById('hint').value.trim();
       vscode.postMessage({ command: 'retry', userHint: hint });
@@ -128,12 +121,10 @@ export class ErrorPanel {
     document.getElementById('close').addEventListener('click', () => {
       vscode.postMessage({ command: 'close' });
     });
-
-    /* Handle updates from extension host */
+    /* live updates */
     window.addEventListener('message', (event) => {
-      const msg = event.data;
-      if (msg.command === 'updateLog') {
-        document.getElementById('lean-log').textContent = msg.log;
+      if (event.data.command === 'updateLog') {
+        document.getElementById('lean-log').textContent = event.data.log;
       }
     });
   </script>
