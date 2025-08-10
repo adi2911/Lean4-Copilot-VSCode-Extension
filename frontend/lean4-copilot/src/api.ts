@@ -1,111 +1,38 @@
+// src/api.ts
 const BASE_URL = process.env.BACKEND_URL ?? "http://localhost:8000";
 
-async function postJSON<T>(url: string, body: unknown): Promise<T> {
-  const res = await fetch(url, {
+/* ------------------------------ HTTP helper ------------------------------ */
+async function postJSON<T>(path: string, body: unknown): Promise<T> {
+  const res = await fetch(`${BASE_URL}${path}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
   if (!res.ok) {
-    throw new Error(`Backend error ${res.status}`);
+    const text = await res.text().catch(() => "");
+    throw new Error(`Backend error ${res.status}${text ? `: ${text}` : ""}`);
   }
-  return res.json() as Promise<T>;
+  return (await res.json()) as T;
 }
 
-export async function completeProof(
-  fileText: string,
-  cursorLine: number,
-  cursorCol: number,
-  maxTokens = 512
-): Promise<CompletionResponse> {
-  return postJSON<CompletionResponse>(`${BASE_URL}/complete`, {
-    file_text: fileText,
-    cursor_line: cursorLine,
-    cursor_col: cursorCol,
-    max_tokens: maxTokens,
-  });
-}
+/* ------------------------------- Types ----------------------------------- */
+export type SuggestResponse = {
+  suggestion?: string;
+  error?: string;
+};
 
-export async function retryProof(
-  fileText: string,
-  errorLog: string,
-  userNote?: string
-): Promise<CompletionResponse> {
-  return postJSON<CompletionResponse>(`${BASE_URL}/retry`, {
-    file_text: fileText,
-    error_log: errorLog,
-    user_note: userNote ?? null,
-  });
-}
-
-export async function callLLMCompletion(
-  fileText: string,
-  line: number,
-  col: number,
-  maxTokens = 128
-): Promise<string> {
-  console.log(">>>>> I was called", fileText);
-  const payload = {
-    file_text: fileText,
-    cursor_line: line,
-    cursor_col: col,
-    max_tokens: maxTokens,
-  };
-
-  const res = await fetch(`${BASE_URL}/complete`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-
-  console.log(">>>> response received ", res.body);
-
-  if (!res.ok || !res.body) {
-    throw new Error("backend /complete failed");
-  }
-
-  // stream the response body into a string
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let out = "";
-
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) {
-      break;
-    }
-    out += decoder.decode(value);
-    if (out.includes("[[END]]")) {
-      break;
-    }
-  }
-  return out.replace("[[END]]", "");
-}
-
-/** Ask /validate whether Lean accepts the file */
-export async function validateWithLean(
-  fullFile: string
-): Promise<LeanValidationResponse> {
-  const res = await fetch(`${BASE_URL}/validate`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ file_text: fullFile }),
-  });
-
-  console.log(">>>> validation received", res.body);
-  if (!res.ok) {
-    throw new Error("backend /validate failed");
-  }
-  // cast unknown → LeanValidationResponse
-  return (await res.json()) as LeanValidationResponse;
-}
-
-/** Handy interface if you want strong typing elsewhere */
-export interface LeanValidationResponse {
+export type CompleteResponse = {
+  proof: string;
   ok: boolean;
-  log: string;
-}
+  log?: string;
+};
 
+export type ValidateResponse = {
+  ok: boolean;
+  error?: string;
+};
+
+/** Legacy shapes kept temporarily so extension.ts compiles before we refactor it */
 export interface CompletionResponse {
   ok: boolean; // proof verifies?
   code: string; // Lean snippet or full file
@@ -115,4 +42,64 @@ export interface CompletionResponse {
 export interface LeanValidationResponse {
   ok: boolean;
   log: string;
+}
+
+/* ------------------------------- APIs ------------------------------------ */
+
+/** /suggest : single-line ghost suggestion */
+export async function suggestLine(
+  fileText: string,
+  cursorLine: number,
+  cursorCol: number
+): Promise<SuggestResponse> {
+  return await postJSON<SuggestResponse>("/suggest", {
+    file_text: fileText,
+    cursor_line: cursorLine,
+    cursor_col: cursorCol,
+  });
+}
+
+export async function completeProof(
+  fileText: string,
+  userHint?: string
+): Promise<CompleteResponse> {
+  const body: Record<string, unknown> = { file_text: fileText };
+  if (userHint && userHint.trim()) {
+    body["instruction"] = userHint.trim();
+  }
+  return await postJSON<CompleteResponse>("/complete", body);
+}
+
+/** /validate : run Lean type-checker */
+export async function validateWithLean(
+  fileText: string
+): Promise<LeanValidationResponse> {
+  const res = await postJSON<ValidateResponse>("/validate", {
+    file_text: fileText,
+  });
+  return { ok: res.ok, log: res.error ?? "" };
+}
+
+/* -------------------------- Legacy wrappers ------------------------------ */
+/** Kept to avoid breaking current extension.ts; will be removed after refactor. */
+
+/** Old ghost call used by inline provider; returns string suggestion directly */
+export async function callLLMCompletion(
+  fileText: string,
+  cursorLine: number,
+  cursorCol: number,
+  _maxTokens?: number
+): Promise<string> {
+  const { suggestion } = await suggestLine(fileText, cursorLine, cursorCol);
+  return suggestion ?? "";
+}
+
+/** Old retry flow; we route it to /complete until frontend is updated */
+export async function retryProof(
+  fileText: string,
+  _errorLog: string,
+  userHint?: string
+): Promise<CompletionResponse> {
+  const res = await completeProof(fileText, userHint);
+  return { ok: res.ok, code: res.proof, log: res.log ?? "" };
 }

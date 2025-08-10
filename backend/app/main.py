@@ -1,101 +1,121 @@
-# backend/app/main.py
+# backend/app/main.py (or main.py at repo root)
 from __future__ import annotations
 
-import asyncio
+import logging
+from typing import Dict
+
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 
-# ── local modules ─────────────────────────────────────────────────────────────
-from app.schemas import (
-    CompletionRequest,
-    CompletionResponse,
-    RetryRequest,
-    ValidationRequest,
-    ValidationResponse,
-)
-from services.prompt_retry_builder import make_retry_prompt, resilient_invoke  # retry logic
-from services.lean_verify import verify_lean_code                     # ↔ lean --run
-
-# ── FastAPI app ───────────────────────────────────────────────────────────────
-app = FastAPI()
-
-
-# ------------------------------------------------------------------------------
-#  /complete  ── ghost-text / “Complete proof” entry point
-# ------------------------------------------------------------------------------
-@app.post("/complete", response_model=CompletionResponse)
-async def complete(req: CompletionRequest):
-    """
-    1. Build the vars dict the pipeline expects.
-    2. Ask the LLM(s) for a suggestion (resilient_invoke includes retries).
-    3. Stream the answer with the sentinel `[[END]]` the front-end splits on.
-    """
-    vars_ = {
-        "file_text": req.file_text,
-        "line": req.cursor_line,
-        "col": req.cursor_col,
-    }
-
-    print(f">>>>> triggered suggestion building")
-
-    # resilient_invoke already wraps generate_suggestion with tenacity.
-    suggestion: str = await resilient_invoke(vars_)
-
-    print(f">>>>>> Receieved suggestion at the endpoint ,method : {suggestion}")
-
-    async def stream():
-        yield suggestion
-        yield "\n[[END]]"
-
-    # VS Code extension consumes plain-text chunks
-    return StreamingResponse(stream(), media_type="text/plain")
-
-
-
-@app.post("/validate", response_model=ValidationResponse)
-async def validate(req: ValidationRequest):
-    print(">>> validate endpoint is call to verify lean code")
-    ok, err = await verify_lean_code(req.file_text)
-    # `err` is raw stderr bytes from `lake exe lean …` (may be None)
-    return {"ok": ok, "log": err.decode() if err else None}
-
-
-# ------------------------------------------------------------------------------
-#  /retry  ── user clicked “Retry” (or supplied a note) after a failed proof
-# ------------------------------------------------------------------------------
-@app.post("/retry", response_model=CompletionResponse)
-async def retry(req: RetryRequest):
-    """
-    Build a specialised prompt that shows:
-      • the current file,
-      • the Lean error log,
-      • the user’s note (optional).
-    The LLM returns a *replacement* fragment; we re-validate it.
-    """
-    messages = make_retry_prompt(
-        file_text=req.file_text,
-        error_log=req.error_log,
-        user_note=req.user_note or "",
+# ── Resilient imports (works for both flat and package layouts) ───────────────
+try:
+    # typical layout: backend/app/services/*
+    from services.langchain_pipeline import (
+        SUGGEST_PIPELINE,
+        RETRY_PIPELINE,
+        COMPLETE_PIPELINE,
     )
+    from services.lean_verify import verify_lean_code
+except Exception:
+    # fallback if services/ is sibling to this file
+    from langchain_pipeline import (
+        SUGGEST_PIPELINE,
+        RETRY_PIPELINE,
+        COMPLETE_PIPELINE,
+    )  # type: ignore
+    from lean_verify import verify_lean_code  # type: ignore
 
-    # Direct OpenAI chat call wrapped in helper; returns *raw* code block(s)
-    from openai_client import chat_completion, strip_fences
+try:
+    from . import schemas  # if this file is part of a package
+except Exception:
+    import schemas  # type: ignore
 
-    raw_fix = await chat_completion(messages)
-    fix = strip_fences(raw_fix)
+# ── App & CORS ────────────────────────────────────────────────────────────────
+app = FastAPI(title="Lean4 Copilot Backend", version="1.0")
 
-    ok, err = await verify_lean_code(fix)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],         # tighten to your extension origin if you prefer
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-    return {
-        "completion": fix,
-        "ok": ok,
-        "log": err.decode() if err else None,
-    }
+log = logging.getLogger("uvicorn.error")
 
+# ── Routes ───────────────────────────────────────────────────────────────────
 
-# ------------------------------------------------------------------------------
-#  Ready!
-# ------------------------------------------------------------------------------
 @app.get("/")
 async def root():
-    return {"status": "lean-copilot backend up ✨"}
+    return {"ok": True, "service": "lean4-copilot", "version": app.version}
+
+
+@app.get("/health")
+async def health():
+    return {"ok": True}
+
+
+@app.post("/suggest", response_model=schemas.SuggestResponse)
+async def suggest(req: schemas.SuggestRequest):
+    """
+    Single-line ghost suggestion at (cursor_line, cursor_col).
+    Returns: {suggestion?: str, error?: str}
+    """
+    try:
+        payload: Dict = {
+            "file_text": req.file_text,
+            "line": req.cursor_line,
+            "col": req.cursor_col,
+        }
+        res = await SUGGEST_PIPELINE.ainvoke(payload)
+        return schemas.SuggestResponse(**res)
+    except Exception as e:
+        # keep stack in server logs, send concise message to client
+        log.exception("Error in /suggest")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/retry", response_model=schemas.RetryResponse)
+async def retry(req: schemas.RetryRequest):
+    """
+    Retry a failed single-line suggestion using Lean error (and optional instruction).
+    Returns: {suggestion?: str, error?: str}
+    """
+    try:
+        payload: Dict = {
+            "file_text": req.file_text,
+            "previous_suggestion": req.previous_suggestion,
+            "error": req.error,
+            "instruction": req.instruction,
+        }
+        res = await RETRY_PIPELINE.ainvoke(payload)
+        return schemas.RetryResponse(**res)
+    except Exception as e:
+        log.exception("Error in /retry")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/complete", response_model=schemas.CompleteResponse)
+async def complete(req: schemas.CompleteRequest):
+    try:
+        res = await COMPLETE_PIPELINE.ainvoke({
+            "file_text": req.file_text,
+            "instruction": req.instruction,   # keep this
+        })
+        return schemas.CompleteResponse(**res)
+    except Exception as e:                    # ← ensure "as e"
+        log.exception("Error in /complete")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/validate", response_model=schemas.ValidateResponse)
+async def validate(req: schemas.ValidateRequest):
+    """
+    Type-check the provided Lean code via CLI.
+    Returns: {ok: bool, error?: str}
+    """
+    try:
+        ok, err = await verify_lean_code(req.file_text)
+        return schemas.ValidateResponse(ok=ok, error=None if ok else (err or ""))
+    except Exception as e:
+        log.exception("Error in /validate")
+        raise HTTPException(status_code=500, detail=str(e))

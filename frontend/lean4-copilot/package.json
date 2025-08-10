@@ -9,17 +9,19 @@
   "categories": [
     "Other"
   ],
+  
   "activationEvents": [
     "onCommand:lean4Copilot.completeProof",
+    "onCommand:lean4Copilot.inlineSuggest",
     "onLanguage:lean4"
   ],
-  "main": "./dist/extension.js",
   "contributes": {
-  "commands": [
-  { "command": "lean4Copilot.completeProof", "title": "Lean4 Copilot: Complete Proof" },
-  { "command": "lean4Copilot.inlineSuggest", "title": "Lean4 Copilot: Ghost Suggest" }
-]
+    "commands": [
+      { "command": "lean4Copilot.completeProof", "title": "Lean4 Copilot: Complete Proof" },
+      { "command": "lean4Copilot.inlineSuggest", "title": "Lean4 Copilot: Ghost Suggest" }
+    ]
   },
+  "main": "./dist/extension.js",
   "scripts": {
     "vscode:prepublish": "npm run package",
     "compile": "npm run check-types && npm run lint && node esbuild.js",

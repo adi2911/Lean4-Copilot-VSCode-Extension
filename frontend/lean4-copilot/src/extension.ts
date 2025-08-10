@@ -1,271 +1,213 @@
+// src/extension.ts
 import * as vscode from "vscode";
-import {
-  callLLMCompletion,
-  completeProof,
-  CompletionResponse,
-  retryProof,
-  validateWithLean,
-} from "./api";
+import { completeProof, suggestLine } from "./api";
 import { cleanSuggestion } from "./CleanSuggestion";
-import { ErrorPanel } from "./ui/ErrorPanel";
+import { ErrorPanel } from "./ui/ErrorPanel"; // your existing panel
 
-/* ───────────────────────── Inline-ghost provider ────────────────────────── */
-class LeanInlineProvider implements vscode.InlineCompletionItemProvider {
+/* ──────────────────────────── Activation ──────────────────────────── */
+
+export function activate(context: vscode.ExtensionContext) {
+  // 1) Register inline ghost provider (Lean4)
+  const inlineProvider = vscode.languages.registerInlineCompletionItemProvider(
+    { language: "lean4" },
+    new GhostInlineProvider()
+  );
+
+  // 2) Register "Complete Proof" command
+  const completeCmd = vscode.commands.registerCommand(
+    "lean4Copilot.completeProof",
+    () => handleCompleteProof(context)
+  );
+
+  // (Optional) no-op command for discoverability in Command Palette
+  const ghostCmd = vscode.commands.registerCommand(
+    "lean4Copilot.inlineSuggest",
+    () => {
+      vscode.window.setStatusBarMessage(
+        "Lean4 Copilot inline suggestions are active.",
+        2000
+      );
+    }
+  );
+
+  context.subscriptions.push(inlineProvider, completeCmd, ghostCmd);
+
+  // Track panel lifecycle
+  ErrorPanel.init(context);
+}
+
+/* ─────────────────── Ghost Inline Suggestion Provider ─────────────────── */
+
+class GhostInlineProvider implements vscode.InlineCompletionItemProvider {
+  // Prevent spamming backend: cache last request by doc+pos+version
+  private lastKey: string | null = null;
+  private lastSuggestion: string | null = null;
+
   async provideInlineCompletionItems(
-    doc: vscode.TextDocument,
-    pos: vscode.Position,
-    _ctx: vscode.InlineCompletionContext,
-    token: vscode.CancellationToken
-  ): Promise<vscode.InlineCompletionList> {
-    let res: CompletionResponse;
+    document: vscode.TextDocument,
+    position: vscode.Position,
+    _context: vscode.InlineCompletionContext,
+    _token: vscode.CancellationToken
+  ): Promise<vscode.InlineCompletionList | null> {
     try {
-      res = await completeProof(doc.getText(), pos.line, pos.character);
-    } catch (e: any) {
-      console.error("[Lean4-Copilot] backend error:", e);
-      return { items: [] };
-    }
-    if (token.isCancellationRequested) return { items: [] };
+      const key = `${document.uri.toString()}@${document.version}:${
+        position.line
+      }:${position.character}`;
 
-    /* 1. happy path → ghost text */
-    if (res.ok) {
-      const tail = extractTail(doc.getText(), res.code, doc.offsetAt(pos));
-      return tail.trim()
-        ? { items: [new vscode.InlineCompletionItem(tail)] }
-        : { items: [] };
-    }
-
-    /* 2. compilation failed → error panel */
-    const ed = vscode.window.activeTextEditor;
-    if (ed) await handle(res, ed);
-    return { items: [] };
-  }
-}
-
-/* heuristic: keep only new suffix */
-function extractTail(
-  original: string,
-  candidate: string,
-  cursorIdx: number
-): string {
-  if (
-    candidate.length > cursorIdx &&
-    candidate.startsWith(original.slice(0, cursorIdx))
-  ) {
-    return candidate.slice(cursorIdx);
-  }
-  return "";
-}
-
-/* ───────────────────────── Activation ───────────────────────────────────── */
-export function activate(ctx: vscode.ExtensionContext) {
-  console.log("Lean4 Copilot activated ✅");
-
-  /* register provider for Lean3+Lean4 */
-  const selector: vscode.DocumentSelector = [
-    { language: "lean4", scheme: "file" },
-    { language: "lean", scheme: "file" },
-  ];
-  ctx.subscriptions.push(
-    vscode.languages.registerInlineCompletionItemProvider(
-      selector,
-      new LeanInlineProvider()
-    )
-  );
-
-  ctx.subscriptions.push(
-    vscode.commands.registerCommand("lean4Copilot.completeProof", async () => {
-      const ed = vscode.window.activeTextEditor;
-      if (!ed) {
-        vscode.window.showErrorMessage("No active editor");
-        return;
+      if (this.lastKey === key && this.lastSuggestion) {
+        return listFor(position, this.lastSuggestion);
       }
-      await runCompletion(ed);
-    })
-  );
-
-  const provider: vscode.InlineCompletionItemProvider = {
-    async provideInlineCompletionItems(
-      document,
-      position,
-      context,
-      _token
-    ): Promise<vscode.InlineCompletionList> {
-      console.log(">>>>>>> vscode.InlineCompletionItemProvider");
-
-      // Debounce at 300 ms
-      await new Promise((r) => setTimeout(r, 300));
 
       const fileText = document.getText();
-
-      const suggestionRaw = await callLLMCompletion(
+      const { suggestion } = await suggestLine(
         fileText,
-        position.line + 1,
-        position.character + 1,
-        128
+        position.line,
+        position.character
       );
-      console.log(">>>> received the suggestion moving to cleaning process");
-      let suggestion = cleanSuggestion(suggestionRaw);
-      console.log(">>>> clean suggestion : ", suggestion);
 
-      if (!suggestion.startsWith("\n")) {
-        suggestion = "\n  " + suggestion.trimStart();
+      if (!suggestion) {
+        this.lastKey = key;
+        this.lastSuggestion = null;
+        return null;
       }
 
-      // quick pre-check to avoid obvious junk
-      if (!suggestion.trim()) return { items: [] };
+      const ghost = cleanSuggestion(suggestion);
 
-      // validate before showing
-
-      console.log(">>>> Moving to validating the response");
-      const okResp = await validateWithLean(
-        fileText.slice(0, document.offsetAt(position)) +
-          suggestion +
-          fileText.slice(document.offsetAt(position))
-      );
-      if (!okResp.ok) return { items: [] };
-
-      console.log(`>>>>>> verification done ,Showing suggestion ${position}`);
-      // VS Code shows it as greyed ghost text
-      const item = new vscode.InlineCompletionItem(
-        suggestion,
-        new vscode.Range(position, position)
-      );
-      return { items: [item] };
-    },
-  };
-
-  // register provider for Lean files
-  ctx.subscriptions.push(
-    vscode.languages.registerInlineCompletionItemProvider(
-      { language: "lean4" },
-      provider
-    )
-  );
-
-  ctx.subscriptions.push(
-    vscode.commands.registerCommand("lean4Copilot.inlineSuggest", async () => {
-      // If user disabled inlineSuggest, tip them & bail out
-      const inlineEnabled = vscode.workspace
-        .getConfiguration("editor")
-        .get<boolean>("inlineSuggest.enabled", false);
-
-      if (!inlineEnabled) {
-        vscode.window.showWarningMessage(
-          "Enable Settings › Editor › Inline Suggest to see ghost completions."
-        );
-        return;
+      if (!ghost) {
+        return null;
       }
-      await vscode.commands.executeCommand(
-        "editor.action.inlineSuggest.trigger"
-      );
-    })
-  );
-}
-export function deactivate() {}
 
-/* ───────────────────────── Diff-view completion (old path) ─────────────── */
-async function runCompletion(editor: vscode.TextEditor) {
-  const { document, selection } = editor;
-  try {
-    const res = await completeProof(
-      document.getText(),
-      selection.active.line,
-      selection.active.character
-    );
-    await handle(res, editor);
-  } catch (e: any) {
-    vscode.window.showErrorMessage(`Completion failed: ${e.message ?? e}`);
-  }
-}
+      this.lastKey = key;
+      this.lastSuggestion = suggestion;
 
-/* ───────────────────────── Shared error / diff logic ───────────────────── */
-let errorPanel: ErrorPanel | undefined;
-let diffDoc: vscode.TextDocument | undefined;
-
-async function handle(res: CompletionResponse, editor: vscode.TextEditor) {
-  /* success → diff-view */
-  if (res.ok) {
-    await showDiffAndApply(res.code, editor);
-    closeErrorPanel();
-    return;
-  }
-
-  /* failure → singleton ErrorPanel */
-  if (!errorPanel) {
-    errorPanel = ErrorPanel.create(res.log, retryWithHint);
-    errorPanel.onDidDispose(() => (errorPanel = undefined));
-  } else {
-    errorPanel.update(res.log);
-    errorPanel.reveal();
-  }
-
-  async function retryWithHint({ userHint }: { userHint: string | null }) {
-    try {
-      const newRes = await retryProof(
-        res.code,
-        res.log,
-        userHint && userHint.trim() ? userHint : undefined
-      );
-      await handle(newRes, editor);
-    } catch (e: any) {
-      vscode.window.showErrorMessage(`Retry failed: ${e.message ?? e}`);
+      return listFor(position, ghost);
+    } catch {
+      // Stay silent on inline errors to avoid noisy UX
+      return null;
     }
   }
 }
 
-/* ───────────────────────── Diff helpers ────────────────────────────────── */
-async function showDiffAndApply(fixed: string, editor: vscode.TextEditor) {
-  if (fixed === editor.document.getText()) {
-    vscode.window.showInformationMessage("Nothing to apply – proof already OK");
+function listFor(
+  pos: vscode.Position,
+  text: string
+): vscode.InlineCompletionList {
+  const range = new vscode.Range(pos, pos);
+  const item = new vscode.InlineCompletionItem(text, range);
+  return { items: [item] };
+}
+
+/* ─────────────────────── Complete Proof Command ─────────────────────── */
+
+async function handleCompleteProof(context: vscode.ExtensionContext) {
+  const editor = vscode.window.activeTextEditor;
+  if (!editor) {
+    vscode.window.showWarningMessage("No active editor.");
     return;
   }
 
-  /* open / refresh diff doc */
-  if (!diffDoc) {
-    diffDoc = await vscode.workspace.openTextDocument({
-      language: editor.document.languageId,
-      content: fixed,
-    });
-  } else {
-    await vscode.workspace.applyEdit(await replaceAll(diffDoc, fixed));
-  }
+  const doc = editor.document;
+  const originalText = doc.getText();
 
+  const progressTitle = "Lean4 Copilot: Completing proof…";
+  const result = await vscode.window.withProgress(
+    { location: vscode.ProgressLocation.Notification, title: progressTitle },
+    async () => {
+      try {
+        const res = await completeProof(originalText);
+
+        if (!res.ok) {
+          // Show error panel with verification log
+          ErrorPanel.show(context, res.log ?? "Verification failed.");
+          return { ok: false as const, proof: res.proof, log: res.log ?? "" };
+        }
+
+        return { ok: true as const, proof: res.proof, log: "" };
+      } catch (e: any) {
+        const msg = e?.message ?? String(e);
+        ErrorPanel.show(context, `Backend error: ${msg}`);
+        return { ok: false as const, proof: originalText, log: msg };
+      }
+    }
+  );
+
+  if (!result.ok) return;
+
+  // Open a temp doc with the proposed full file and show a diff
+  const tempDoc = await vscode.workspace.openTextDocument({
+    content: result.proof,
+    language: doc.languageId || "lean4",
+  });
+
+  await vscode.window.showTextDocument(tempDoc, {
+    preview: true,
+    preserveFocus: true,
+  });
+
+  const title = "Lean4 Copilot: Proposed changes";
   await vscode.commands.executeCommand(
     "vscode.diff",
-    editor.document.uri,
-    diffDoc.uri,
-    "Lean Proof – Proposed Fix",
-    { preview: false }
+    doc.uri,
+    tempDoc.uri,
+    title,
+    { preview: true }
   );
 
-  const choice = await vscode.window.showInformationMessage(
-    "Apply the verified proof?",
-    { modal: false },
-    "Apply ✔︎",
-    "Discard ✖︎"
+  // Ask the user: Apply or Discard
+  const action = await vscode.window.showInformationMessage(
+    "Apply Lean4 Copilot changes?",
+    { modal: true },
+    "Apply",
+    "Discard"
   );
 
-  if (choice === "Apply ✔︎") {
-    await editor.edit((e) => e.replace(fullRange(editor.document), fixed));
-    vscode.window.setStatusBarMessage("✅ Proof applied", 2500);
+  if (action === "Apply") {
+    await applyFullDocumentEdit(doc, result.proof);
+    await closeActiveEditorIfDiff(); // close the diff view
+    // Also close the preview temp doc tab if still open
+    await focusAndCloseDoc(tempDoc.uri);
+    vscode.window.setStatusBarMessage("Lean4 Copilot: Applied.", 2000);
+  } else {
+    await closeActiveEditorIfDiff(); // close the diff view
+    await focusAndCloseDoc(tempDoc.uri);
+    vscode.window.setStatusBarMessage("Lean4 Copilot: Discarded.", 2000);
   }
-
-  /* Close the diff tab in both cases */
-  await vscode.commands.executeCommand("workbench.action.closeActiveEditor");
-  diffDoc = undefined; // reset handle
 }
 
-function closeErrorPanel() {
-  if (errorPanel) errorPanel.dispose();
-}
-function fullRange(doc: vscode.TextDocument) {
-  return new vscode.Range(
+/* ─────────────────────────── Helpers (editor) ─────────────────────────── */
+
+async function applyFullDocumentEdit(
+  doc: vscode.TextDocument,
+  newText: string
+) {
+  const fullRange = new vscode.Range(
     doc.positionAt(0),
     doc.positionAt(doc.getText().length)
   );
+  const editor = await vscode.window.showTextDocument(doc, { preview: false });
+  await editor.edit((eb) => eb.replace(fullRange, newText));
 }
-async function replaceAll(doc: vscode.TextDocument, newText: string) {
-  const edit = new vscode.WorkspaceEdit();
-  edit.replace(doc.uri, fullRange(doc), newText);
-  return edit;
+
+async function closeActiveEditorIfDiff() {
+  // The diff editor becomes active after we run vscode.diff
+  await vscode.commands.executeCommand("workbench.action.closeActiveEditor");
 }
+
+async function focusAndCloseDoc(uri: vscode.Uri) {
+  // Focus the given doc (if it’s open) and close it
+  const doc = vscode.workspace.textDocuments.find(
+    (d) => d.uri.toString() === uri.toString()
+  );
+  if (!doc) return;
+  const editor = vscode.window.visibleTextEditors.find(
+    (e) => e.document === doc
+  );
+  if (editor) {
+    await vscode.window.showTextDocument(editor.document, editor.viewColumn);
+    await vscode.commands.executeCommand("workbench.action.closeActiveEditor");
+  }
+}
+
+/* ─────────────────────────── Deactivation ─────────────────────────── */
+
+export function deactivate() {}

@@ -1,33 +1,85 @@
-from pydantic import BaseModel
+# schemas.py
+from __future__ import annotations
+
 from typing import Optional
+from pydantic import BaseModel, Field
 
 
-class CompletionRequest(BaseModel):
-    file_text: str
-    cursor_line: int
-    cursor_col: int
+# ── /suggest ───────────────────────────────────────────────────────────────────
 
-class CompletionChunk(BaseModel):
-    text: str
-    done: bool = False
+class SuggestRequest(BaseModel):
+    file_text: str = Field(..., description="Current Lean file contents")
+    cursor_line: int = Field(..., ge=0, description="0-based cursor line")
+    cursor_col: int = Field(..., ge=0, description="0-based cursor column")
 
 
-class ValidationRequest(BaseModel):
-    file_text: str
+class SuggestResponse(BaseModel):
+    suggestion: Optional[str] = Field(
+        None, description="Single-line Lean suggestion with trailing newline if verified"
+    )
+    error: Optional[str] = Field(
+        None, description="Lean error snippet if no candidate verified"
+    )
 
-class ValidationResponse(BaseModel):
-    ok: bool
-    log: str | None = None
 
-
-class CompletionResponse(BaseModel):
-    """Unified response for both /complete and /retry."""
-    ok: bool            # proof verifies?
-    code: str           # model’s suggestion (Lean source)
-    log: str            # Lean compiler output (empty if ok=True)
+# ── /retry ─────────────────────────────────────────────────────────────────────
 
 class RetryRequest(BaseModel):
-    """Payload sent when user presses ‘Retry’."""
-    file_text: str              # full Lean file at the time of retry
-    error_log: str              # Lean error trace to show the LLM
-    user_note: Optional[str] = None  # optional hint typed by the user
+    file_text: str = Field(..., description="Current Lean file contents")
+    previous_suggestion: str = Field(
+        ..., description="The prior single-line suggestion that failed"
+    )
+    error: str = Field(..., description="Compiler error from Lean for that suggestion")
+    instruction: Optional[str] = Field(
+        None, description="Optional extra guidance from user"
+    )
+
+
+class RetryResponse(BaseModel):
+    suggestion: Optional[str] = Field(
+        None, description="Single-line Lean suggestion with trailing newline if verified"
+    )
+    error: Optional[str] = Field(
+        None, description="Lean error snippet if no candidate verified"
+    )
+
+
+# ── /complete ──────────────────────────────────────────────────────────────────
+
+class CompleteRequest(BaseModel):
+    file_text: str = Field(..., description="Lean file to complete (entire content)")
+    instruction: Optional[str] = Field(
+        None, description="Optional user hint to guide completion"
+    )
+
+class CompleteResponse(BaseModel):
+    proof: str = Field(..., description="Full Lean file content returned by the model")
+    ok: bool = Field(..., description="True if Lean verification passed")
+    log: Optional[str] = Field(
+        None, description="Verification log or error snippet when ok is False"
+    )
+
+
+# ── /validate ──────────────────────────────────────────────────────────────────
+
+class ValidateRequest(BaseModel):
+    file_text: str = Field(..., description="Lean code to type-check")
+
+
+class ValidateResponse(BaseModel):
+    ok: bool = Field(..., description="True if Lean verification passed")
+    error: Optional[str] = Field(
+        None, description="Compiler error if verification failed"
+    )
+
+
+__all__ = [
+    "SuggestRequest",
+    "SuggestResponse",
+    "RetryRequest",
+    "RetryResponse",
+    "CompleteRequest",
+    "CompleteResponse",
+    "ValidateRequest",
+    "ValidateResponse",
+]
