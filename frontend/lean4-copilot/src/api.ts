@@ -59,15 +59,23 @@ export async function suggestLine(
   });
 }
 
+export type CompleteResult = {
+  ok: boolean;
+  proof: string;
+  log?: string | null;
+  attempt?: string | null; // NEW
+  candidates?: string[]; // NEW (optional)
+};
+
 export async function completeProof(
   fileText: string,
-  userHint?: string
-): Promise<CompleteResponse> {
-  const body: Record<string, unknown> = { file_text: fileText };
-  if (userHint && userHint.trim()) {
-    body["instruction"] = userHint.trim();
-  }
-  return await postJSON<CompleteResponse>("/complete", body);
+  instruction?: string
+): Promise<CompleteResult> {
+  const res = await postJSON<CompleteResult>("/complete", {
+    file_text: fileText,
+    instruction,
+  });
+  return res;
 }
 
 /** /validate : run Lean type-checker */

@@ -9,20 +9,17 @@ load_dotenv()  # pick up OPENAI_API_KEY
 from langchain_openai import ChatOpenAI
 from langchain_core.runnables import RunnableLambda, RunnableParallel
 
-from services.prompt_builder import (
-    make_ghost_prompt,
-    make_retry_prompt,
-    make_complete_proof_prompt,
-    clean_suggestion,
+from app.services.prompt_builder import (
+    make_ghost_prompt, make_retry_prompt, make_complete_proof_prompt, clean_suggestion
 )
-from services.lean_verify import verify_lean_code
+from app.services.lean_verify import verify_lean_code
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Models
 # Keep these names stable so other files (or env switches) don't break.
 # ──────────────────────────────────────────────────────────────────────────────
-FAST_MODEL_NAME  = "gpt-4o-mini"  # cheap/fast
-SMART_MODEL_NAME = "gpt-4o"      # higher quality
+FAST_MODEL_NAME  ="gpt-4.1-2025-04-14" #"gpt-5-2025-08-07" #"gpt-4o-mini"  # cheap/fast
+SMART_MODEL_NAME = "gpt-5-chat-latest" #"gpt-4o"      # higher quality
 
 FAST_MODEL  = ChatOpenAI(model=FAST_MODEL_NAME,  temperature=0.2, max_tokens=128)
 SMART_MODEL = ChatOpenAI(model=SMART_MODEL_NAME, temperature=0.2, max_tokens=256)
@@ -123,26 +120,47 @@ async def _run_complete(inputs: Dict) -> Dict:
     file_text = inputs["file_text"]
     instruction = inputs.get("instruction")
 
-    # --- robust call so old prompt_builder doesn't crash us
+    # Build prompt (backward‑compatible with older signature)
     try:
         prompt = make_complete_proof_prompt(file_text=file_text, instruction=instruction)
     except TypeError:
-        # Fallback to old signature (no instruction)
         prompt = make_complete_proof_prompt(file_text=file_text)
 
     candidates = await _call_llms(prompt)
-    last_log = None
-    for raw in (candidates[1], candidates[0]):
-        proof = raw.strip()
+
+    # Prefer SMART then FAST (your existing ordering)
+    ordered = [candidates[1], candidates[0]]
+
+    last_error: Optional[str] = None
+    attempt_text: Optional[str] = None  
+
+    for raw in ordered:
+        proof = (raw or "").strip()
         if not proof:
             continue
+
+        # remember the first substantive attempt (shown in ErrorPanel)
+        if attempt_text is None:
+            attempt_text = proof
+
         ok, log = await verify_lean_code(proof)
         if ok:
             return {"proof": proof, "ok": True, "log": None}
-        last_log = _short_err(log)
 
-    fallback = candidates[1].strip() or candidates[0].strip()
-    return {"proof": fallback, "ok": False, "log": last_log}
+        last_error = _short_err(log)
+
+    # If both candidates failed, expose context for the UI
+    # Fallback "attempt" if all candidates were empty
+    if not attempt_text:
+        attempt_text = (ordered[0] or "").strip() or (ordered[1] or "").strip()
+
+    return {
+        "ok": False,
+        "proof": "",                             # keep shape stable
+        "log": last_error or "Verification failed.",
+        "attempt": attempt_text or "",
+        "candidates": candidates,               # optional, helpful for debugging
+    }
 
 
 def _cursor_window(file_text: str, line: int, col: int, before: int = 30, after: int = 5) -> str:

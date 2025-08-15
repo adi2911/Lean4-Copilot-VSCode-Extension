@@ -2,6 +2,7 @@
 from fastapi.testclient import TestClient
 from app.main import app
 from app.services import langchain_pipeline as lp
+from app import main as app_main
 
 client = TestClient(app)
 
@@ -30,7 +31,7 @@ def test_complete_endpoint(monkeypatch):
     assert r.json()["ok"] is True
 
 def test_validate_endpoint(monkeypatch):
-    monkeypatch.setattr(lp, "verify_lean_code", fake_verify)
+    monkeypatch.setattr(app_main, "verify_lean_code", fake_verify)
     r = client.post("/validate", json={"file_text":"theorem t : True := by rfl\n"})
     assert r.status_code == 200
     assert r.json()["ok"] is True

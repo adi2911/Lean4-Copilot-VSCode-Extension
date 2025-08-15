@@ -9,8 +9,9 @@ def run(coro):
 
 def test_suggest_returns_verified_candidate(monkeypatch):
     # Pretend LLMs returned 2 candidates
-    monkeypatch.setattr(lp, "_call_llms", lambda prompt: asyncio.Future())
-    lp._call_llms.return_value.set_result(["bad\n", "rfl\n"])  # [fast, smart]
+    fut = asyncio.get_event_loop().create_future()
+    fut.set_result(["bad\n", "rfl\n"])  # [fast, smart]
+    monkeypatch.setattr(lp, "_call_llms", lambda prompt: fut)
 
     # Verify only the cleaned "rfl\n" passes
     async def fake_verify(code):

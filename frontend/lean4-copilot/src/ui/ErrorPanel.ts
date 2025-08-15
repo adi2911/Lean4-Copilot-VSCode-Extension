@@ -1,22 +1,39 @@
-// src/ErrorPanel.ts
 import * as vscode from "vscode";
+import { CompleteResult } from "../api";
 import { retryWithHint } from "../retry";
 
 export class ErrorPanel {
   private static ctx: vscode.ExtensionContext;
   private static panel: vscode.WebviewPanel | null = null;
 
+  // NEW: remember which doc to retry against
+  private static targetUri: vscode.Uri | null = null;
+
   /** Call once from activate() */
   static init(ctx: vscode.ExtensionContext) {
     this.ctx = ctx;
   }
 
-  /** Open or reveal the panel with the given log text */
-  static show(ctx: vscode.ExtensionContext, logText: string) {
+  static show(
+    ctx: vscode.ExtensionContext,
+    logText: string,
+    targetUri?: vscode.Uri,
+    attemptText?: string
+  ) {
     if (!this.ctx) this.ctx = ctx;
+    this.targetUri =
+      targetUri ??
+      vscode.window.activeTextEditor?.document.uri ??
+      this.targetUri ??
+      null;
+
     if (this.panel) {
       this.panel.reveal(vscode.ViewColumn.Beside);
-      this.panel.webview.postMessage({ command: "updateLog", log: logText });
+      this.panel.webview.postMessage({
+        command: "updateError",
+        log: logText,
+        attempt: attemptText ?? "",
+      });
       return;
     }
 
@@ -24,10 +41,7 @@ export class ErrorPanel {
       "lean4CopilotError",
       "Lean4 Copilot — Verification Log",
       { viewColumn: vscode.ViewColumn.Beside, preserveFocus: true },
-      {
-        enableScripts: true,
-        retainContextWhenHidden: true,
-      }
+      { enableScripts: true, retainContextWhenHidden: true }
     );
 
     this.panel.onDidDispose(
@@ -35,10 +49,12 @@ export class ErrorPanel {
       null,
       this.ctx.subscriptions
     );
+    this.panel.webview.html = this.getHtml(
+      this.panel.webview,
+      logText,
+      attemptText ?? ""
+    );
 
-    this.panel.webview.html = this.getHtml(this.panel.webview, logText);
-
-    // Messages FROM webview
     this.panel.webview.onDidReceiveMessage(async (msg) => {
       switch (msg.command) {
         case "retry": {
@@ -47,10 +63,9 @@ export class ErrorPanel {
           await this.handleRetry(hint);
           break;
         }
-        case "close": {
+        case "close":
           this.dispose();
           break;
-        }
       }
     });
   }
@@ -65,40 +80,47 @@ export class ErrorPanel {
   /* ───────────────────────────── Internals ───────────────────────────── */
 
   private static async handleRetry(userHint?: string) {
-    // Get active file text (extension host side, not from webview)
-    const editor = vscode.window.activeTextEditor;
-    if (!editor) {
+    // Use the remembered document, not the active editor (which is the webview)
+    const uri =
+      this.targetUri ?? vscode.window.activeTextEditor?.document.uri ?? null;
+    if (!uri) {
       vscode.window.showWarningMessage(
         "Lean4 Copilot: No active editor to retry."
       );
       return;
     }
-    const originalDoc = editor.document;
+
+    const originalDoc = await vscode.workspace.openTextDocument(uri);
     const fileText = originalDoc.getText();
 
     const progressTitle = "Lean4 Copilot: Retrying…";
-    const result = await vscode.window.withProgress(
+    const result = await vscode.window.withProgress<CompleteResult>(
       { location: vscode.ProgressLocation.Notification, title: progressTitle },
-      async () => {
+      async (_progress, _token) => {
         try {
           const res = await retryWithHint(fileText, userHint);
-          return res; // { ok, proof, log }
+          return res; // CompleteResult
         } catch (e: any) {
-          return { ok: false, proof: fileText, log: e?.message ?? String(e) };
+          return {
+            ok: false,
+            proof: fileText,
+            log: e?.message ?? String(e),
+            attempt: null,
+          };
         }
       }
     );
 
     if (!result.ok) {
-      // Update log in the panel
       this.postToWebview({
-        command: "updateLog",
+        command: "updateError",
         log: result.log || "Verification failed.",
+        attempt: result.attempt ?? "",
       });
       return;
     }
 
-    // Success: close the panel and open the diff with Apply/Discard
+    // success unchanged
     this.dispose();
     await this.openDiffWithApplyDiscard(originalDoc, result.proof);
   }
@@ -187,75 +209,206 @@ export class ErrorPanel {
     }
   }
 
-  private static getHtml(webview: vscode.Webview, logText: string): string {
-    // Basic styles inline for portability
+  private static getHtml(
+    _webview: vscode.Webview,
+    logText: string,
+    attemptText: string
+  ): string {
     const css = `
-      :root { color-scheme: light dark; --pad: 12px; --gap: 10px; }
-      body { font-family: var(--vscode-font-family); margin: 0; padding: var(--pad); }
-      h2 { margin: 0 0 var(--gap) 0; font-weight: 600; }
-      .box { border: 1px solid var(--vscode-editorWidget-border);
-             background: var(--vscode-editorWidget-background);
-             padding: var(--pad); border-radius: 8px; }
-      textarea { width: 100%; box-sizing: border-box; min-height: 64px; }
-      pre { white-space: pre-wrap; margin: 0; max-height: 40vh; overflow: auto; }
-      .row { display: flex; gap: var(--gap); align-items: center; margin-top: var(--gap); }
-      button { padding: 6px 12px; }
-      .hintlabel { font-size: 12px; opacity: .8; margin-bottom: 6px; display:block; }
-    `;
+    :root {
+      color-scheme: light dark;
+      --pad: 12px; --gap: 12px; --radius: 8px;
+      --fg: var(--vscode-foreground);
+      --muted: var(--vscode-descriptionForeground);
+      --card-bg: var(--vscode-editorWidget-background);
+      --card-border: var(--vscode-editorWidget-border);
+      --btn-bg: var(--vscode-button-background);
+      --btn-fg: var(--vscode-button-foreground);
+      --btn-hover: var(--vscode-button-hoverBackground);
+      --input-bg: var(--vscode-input-background);
+      --input-fg: var(--vscode-input-foreground);
+      --input-border: var(--vscode-input-border);
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      font-family: var(--vscode-font-family);
+      color: var(--fg);
+      margin: 0;
+      padding: calc(var(--pad) * 1.25);
+      line-height: 1.4;
+    }
+
+    h2 {
+      margin: 0 0 var(--gap) 0;
+      font-weight: 700;
+      letter-spacing: .2px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: var(--gap);
+    }
+
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: var(--radius);
+      padding: var(--pad);
+    }
+
+    .card-title {
+      font-weight: 600;
+      margin-bottom: 8px;
+    }
+
+    .mono {
+      font-family: var(--vscode-editor-font-family, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace);
+      white-space: pre-wrap;
+      overflow: auto;
+      max-height: 40vh;
+      line-height: 1.45;
+      padding: 8px;
+      background: var(--vscode-editor-background, transparent);
+      border: 1px solid var(--card-border);
+      border-radius: 6px;
+    }
+
+    .muted { color: var(--muted); }
+
+    .input-block {
+      display: grid;
+      gap: 8px;
+    }
+
+    textarea {
+      width: 100%;
+      min-height: 90px;
+      resize: vertical;
+      border-radius: 6px;
+      border: 1px solid var(--input-border);
+      background: var(--input-bg);
+      color: var(--input-fg);
+      padding: 10px;
+      font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
+      line-height: 1.45;
+    }
+
+    .actions {
+      display: flex;
+      gap: 8px;
+      justify-content: flex-end;
+      margin-top: 10px;
+    }
+
+    button {
+      cursor: pointer;
+      border: none;
+      border-radius: 6px;
+      padding: 6px 12px;
+      background: var(--btn-bg);
+      color: var(--btn-fg);
+    }
+    button:hover { background: var(--btn-hover); }
+
+    .row-actions {
+      display: flex;
+      gap: 8px;
+      justify-content: flex-end;
+      margin-top: 8px;
+    }
+
+    @media (min-width: 920px) {
+      .grid {
+        grid-template-columns: 1fr 1fr;
+      }
+    }
+  `;
 
     const js = `
-      const vscode = acquireVsCodeApi();
+    const vscode = acquireVsCodeApi();
 
-      const logEl = document.getElementById('log');
-      const hintEl = document.getElementById('hint');
-      const retryBtn = document.getElementById('retry');
-      const closeBtn = document.getElementById('close');
+    const attemptEl = document.getElementById('attempt');
+    const logEl = document.getElementById('log');
+    const hintEl = document.getElementById('hint');
 
-      window.addEventListener('message', (event) => {
-        const msg = event.data;
-        if (msg?.command === 'updateLog') {
-          logEl.textContent = msg.log || '';
-        }
-      });
+    document.getElementById('retry').addEventListener('click', () => {
+      vscode.postMessage({ command: 'retry', hint: hintEl.value });
+    });
+    document.getElementById('close').addEventListener('click', () => {
+      vscode.postMessage({ command: 'close' });
+    });
 
-      retryBtn.addEventListener('click', () => {
-        const hint = hintEl.value;
-        vscode.postMessage({ command: 'retry', hint });
-      });
+    // Copy helpers
+    document.getElementById('copyAttempt').addEventListener('click', async () => {
+      try { await navigator.clipboard.writeText(attemptEl.textContent || ''); } catch {}
+    });
+    document.getElementById('copyError').addEventListener('click', async () => {
+      try { await navigator.clipboard.writeText(logEl.textContent || ''); } catch {}
+    });
 
-      closeBtn.addEventListener('click', () => {
-        vscode.postMessage({ command: 'close' });
-      });
-    `;
+    // Live updates from extension
+    window.addEventListener('message', (event) => {
+      const msg = event.data;
+      if (msg?.command === 'updateError') {
+        attemptEl.textContent = msg.attempt || '';
+        logEl.textContent = msg.log || '';
+      }
+    });
+  `;
 
-    const html = `
-      <!DOCTYPE html>
-      <html>
-      <head>
-        <meta charset="UTF-8" />
-        <style>${css}</style>
-        <title>Lean4 Copilot — Verification Log</title>
-      </head>
-      <body>
-        <h2>Lean4 Copilot — Verification Log</h2>
-        <div class="box"><pre id="log">${escapeHtml(logText)}</pre></div>
+    // escape HTML to avoid accidental markup from logs
+    const esc = (s: string) =>
+      s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
-        <div class="row" style="flex-direction: column; align-items: stretch;">
-          <label class="hintlabel" for="hint">Retry with hint (optional):</label>
-        <textarea id="hint" placeholder="e.g., try using &grave;simp: any&grave; then &grave;rfl&grave;, or rewrite using lemma XYZ"></textarea>
-</div>
+    return `
+  <!doctype html>
+  <html>
+    <head>
+      <meta charset="utf-8"/>
+      <title>Lean4 Copilot — Verification Log</title>
+      <style>${css}</style>
+    </head>
+    <body>
+      <h2>Lean4 Copilot — Verification Log</h2>
 
-        <div class="row">
+      <div class="grid">
+        <!-- Model attempt -->
+        <section class="card">
+          <div class="card-title">Model attempt</div>
+          <pre id="attempt" class="mono">${esc(attemptText)}</pre>
+          <div class="row-actions">
+            <button id="copyAttempt" title="Copy attempt">Copy</button>
+          </div>
+        </section>
+
+        <!-- Lean error -->
+        <section class="card">
+          <div class="card-title">Lean error</div>
+          <pre id="log" class="mono">${esc(
+            logText || "Verification failed."
+          )}</pre>
+          <div class="row-actions">
+            <button id="copyError" title="Copy error">Copy</button>
+          </div>
+        </section>
+      </div>
+
+      <section class="card" style="margin-top:12px;">
+        <div class="card-title">Retry with hint <span class="muted">(optional)</span></div>
+        <div class="input-block">
+          <textarea id="hint" placeholder="e.g., try 'simp' then 'rfl', or rewrite using lemma XYZ"></textarea>
+        </div>
+        <div class="actions">
           <button id="retry">Retry</button>
           <button id="close">Close</button>
         </div>
+      </section>
 
-        <script>${js}</script>
-      </body>
-      </html>
-    `;
-
-    return html;
+      <script>${js}</script>
+    </body>
+  </html>`;
   }
 }
 

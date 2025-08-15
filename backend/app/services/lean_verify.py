@@ -37,6 +37,7 @@ async def verify_lean_code(code: str) -> Tuple[bool, str | None]:
 
         # Trim error output
         err_str = stderr.decode("utf-8", errors="replace").strip()
+        print(f"error on lean verify :{err_str}")
         return False, _short_err(err_str)
 
     except FileNotFoundError:

@@ -53,12 +53,11 @@ class CompleteRequest(BaseModel):
     )
 
 class CompleteResponse(BaseModel):
-    proof: str = Field(..., description="Full Lean file content returned by the model")
-    ok: bool = Field(..., description="True if Lean verification passed")
-    log: Optional[str] = Field(
-        None, description="Verification log or error snippet when ok is False"
-    )
-
+    ok: bool
+    proof: str = ""                    
+    log: Optional[str] = None          
+    attempt: Optional[str] = None     
+    candidates: Optional[List[str]] = None
 
 # ── /validate ──────────────────────────────────────────────────────────────────
 

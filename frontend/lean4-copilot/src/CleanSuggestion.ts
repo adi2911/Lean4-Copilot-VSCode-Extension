@@ -1,5 +1,3 @@
-// src/CleanSuggestion.ts
-
 /**
  * Normalize model output to a single Lean line suitable for inline ghost text:
  * - Strip markdown fences/backticks

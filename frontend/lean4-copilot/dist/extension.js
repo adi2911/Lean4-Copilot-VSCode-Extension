@@ -57,36 +57,12 @@ async function suggestLine(fileText, cursorLine, cursorCol) {
     cursor_col: cursorCol
   });
 }
-async function completeProof(fileText, userHint) {
-  const body = { file_text: fileText };
-  if (userHint && userHint.trim()) {
-    body["instruction"] = userHint.trim();
-  }
-  return await postJSON("/complete", body);
-}
-
-// src/CleanSuggestion.ts
-function cleanSuggestion(raw) {
-  if (!raw) return "";
-  let t = raw.trim();
-  if (t.startsWith("```")) {
-    t = t.split("\n").filter((ln) => !ln.trim().startsWith("```")).join("\n").trim();
-  }
-  const lines = t.split(/\r?\n/);
-  for (const ln of lines) {
-    const noComment = stripLineComment(ln).trim();
-    if (!noComment) continue;
-    const single = noComment.replace(/\s+/g, " ").trim();
-    return single + "\n";
-  }
-  return "";
-}
-function stripLineComment(line) {
-  const idx = line.indexOf("--");
-  if (idx === -1) return line;
-  const before = line.slice(0, idx);
-  if (/^\s*$/.test(before)) return "";
-  return before;
+async function completeProof(fileText, instruction) {
+  const res = await postJSON("/complete", {
+    file_text: fileText,
+    instruction
+  });
+  return res;
 }
 
 // src/ui/ErrorPanel.ts
@@ -98,7 +74,10 @@ async function retryWithHint(fileText, userHint) {
   return {
     ok: res.ok,
     proof: res.proof,
-    log: res.log ?? ""
+    log: res.log ?? "",
+    attempt: res.attempt ?? null,
+    // ⬅️ keep null if absent
+    candidates: res.candidates
   };
 }
 
@@ -106,33 +85,40 @@ async function retryWithHint(fileText, userHint) {
 var ErrorPanel = class _ErrorPanel {
   static ctx;
   static panel = null;
+  // NEW: remember which doc to retry against
+  static targetUri = null;
   /** Call once from activate() */
   static init(ctx) {
     this.ctx = ctx;
   }
-  /** Open or reveal the panel with the given log text */
-  static show(ctx, logText) {
+  static show(ctx, logText, targetUri, attemptText) {
     if (!this.ctx) this.ctx = ctx;
+    this.targetUri = targetUri ?? vscode.window.activeTextEditor?.document.uri ?? this.targetUri ?? null;
     if (this.panel) {
       this.panel.reveal(vscode.ViewColumn.Beside);
-      this.panel.webview.postMessage({ command: "updateLog", log: logText });
+      this.panel.webview.postMessage({
+        command: "updateError",
+        log: logText,
+        attempt: attemptText ?? ""
+      });
       return;
     }
     this.panel = vscode.window.createWebviewPanel(
       "lean4CopilotError",
       "Lean4 Copilot \u2014 Verification Log",
       { viewColumn: vscode.ViewColumn.Beside, preserveFocus: true },
-      {
-        enableScripts: true,
-        retainContextWhenHidden: true
-      }
+      { enableScripts: true, retainContextWhenHidden: true }
     );
     this.panel.onDidDispose(
       () => _ErrorPanel.panel = null,
       null,
       this.ctx.subscriptions
     );
-    this.panel.webview.html = this.getHtml(this.panel.webview, logText);
+    this.panel.webview.html = this.getHtml(
+      this.panel.webview,
+      logText,
+      attemptText ?? ""
+    );
     this.panel.webview.onDidReceiveMessage(async (msg) => {
       switch (msg.command) {
         case "retry": {
@@ -140,10 +126,9 @@ var ErrorPanel = class _ErrorPanel {
           await this.handleRetry(hint);
           break;
         }
-        case "close": {
+        case "close":
           this.dispose();
           break;
-        }
       }
     });
   }
@@ -155,31 +140,37 @@ var ErrorPanel = class _ErrorPanel {
   }
   /* ───────────────────────────── Internals ───────────────────────────── */
   static async handleRetry(userHint) {
-    const editor = vscode.window.activeTextEditor;
-    if (!editor) {
+    const uri = this.targetUri ?? vscode.window.activeTextEditor?.document.uri ?? null;
+    if (!uri) {
       vscode.window.showWarningMessage(
         "Lean4 Copilot: No active editor to retry."
       );
       return;
     }
-    const originalDoc = editor.document;
+    const originalDoc = await vscode.workspace.openTextDocument(uri);
     const fileText = originalDoc.getText();
     const progressTitle = "Lean4 Copilot: Retrying\u2026";
     const result = await vscode.window.withProgress(
       { location: vscode.ProgressLocation.Notification, title: progressTitle },
-      async () => {
+      async (_progress, _token) => {
         try {
           const res = await retryWithHint(fileText, userHint);
           return res;
         } catch (e) {
-          return { ok: false, proof: fileText, log: e?.message ?? String(e) };
+          return {
+            ok: false,
+            proof: fileText,
+            log: e?.message ?? String(e),
+            attempt: null
+          };
         }
       }
     );
     if (!result.ok) {
       this.postToWebview({
-        command: "updateLog",
-        log: result.log || "Verification failed."
+        command: "updateError",
+        log: result.log || "Verification failed.",
+        attempt: result.attempt ?? ""
       });
       return;
     }
@@ -255,109 +246,302 @@ var ErrorPanel = class _ErrorPanel {
       this.panel.webview.postMessage(message);
     }
   }
-  static getHtml(webview, logText) {
+  static getHtml(_webview, logText, attemptText) {
     const css = `
-      :root { color-scheme: light dark; --pad: 12px; --gap: 10px; }
-      body { font-family: var(--vscode-font-family); margin: 0; padding: var(--pad); }
-      h2 { margin: 0 0 var(--gap) 0; font-weight: 600; }
-      .box { border: 1px solid var(--vscode-editorWidget-border);
-             background: var(--vscode-editorWidget-background);
-             padding: var(--pad); border-radius: 8px; }
-      textarea { width: 100%; box-sizing: border-box; min-height: 64px; }
-      pre { white-space: pre-wrap; margin: 0; max-height: 40vh; overflow: auto; }
-      .row { display: flex; gap: var(--gap); align-items: center; margin-top: var(--gap); }
-      button { padding: 6px 12px; }
-      .hintlabel { font-size: 12px; opacity: .8; margin-bottom: 6px; display:block; }
-    `;
+    :root {
+      color-scheme: light dark;
+      --pad: 12px; --gap: 12px; --radius: 8px;
+      --fg: var(--vscode-foreground);
+      --muted: var(--vscode-descriptionForeground);
+      --card-bg: var(--vscode-editorWidget-background);
+      --card-border: var(--vscode-editorWidget-border);
+      --btn-bg: var(--vscode-button-background);
+      --btn-fg: var(--vscode-button-foreground);
+      --btn-hover: var(--vscode-button-hoverBackground);
+      --input-bg: var(--vscode-input-background);
+      --input-fg: var(--vscode-input-foreground);
+      --input-border: var(--vscode-input-border);
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      font-family: var(--vscode-font-family);
+      color: var(--fg);
+      margin: 0;
+      padding: calc(var(--pad) * 1.25);
+      line-height: 1.4;
+    }
+
+    h2 {
+      margin: 0 0 var(--gap) 0;
+      font-weight: 700;
+      letter-spacing: .2px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: var(--gap);
+    }
+
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: var(--radius);
+      padding: var(--pad);
+    }
+
+    .card-title {
+      font-weight: 600;
+      margin-bottom: 8px;
+    }
+
+    .mono {
+      font-family: var(--vscode-editor-font-family, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace);
+      white-space: pre-wrap;
+      overflow: auto;
+      max-height: 40vh;
+      line-height: 1.45;
+      padding: 8px;
+      background: var(--vscode-editor-background, transparent);
+      border: 1px solid var(--card-border);
+      border-radius: 6px;
+    }
+
+    .muted { color: var(--muted); }
+
+    .input-block {
+      display: grid;
+      gap: 8px;
+    }
+
+    textarea {
+      width: 100%;
+      min-height: 90px;
+      resize: vertical;
+      border-radius: 6px;
+      border: 1px solid var(--input-border);
+      background: var(--input-bg);
+      color: var(--input-fg);
+      padding: 10px;
+      font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
+      line-height: 1.45;
+    }
+
+    .actions {
+      display: flex;
+      gap: 8px;
+      justify-content: flex-end;
+      margin-top: 10px;
+    }
+
+    button {
+      cursor: pointer;
+      border: none;
+      border-radius: 6px;
+      padding: 6px 12px;
+      background: var(--btn-bg);
+      color: var(--btn-fg);
+    }
+    button:hover { background: var(--btn-hover); }
+
+    .row-actions {
+      display: flex;
+      gap: 8px;
+      justify-content: flex-end;
+      margin-top: 8px;
+    }
+
+    @media (min-width: 920px) {
+      .grid {
+        grid-template-columns: 1fr 1fr;
+      }
+    }
+  `;
     const js = `
-      const vscode = acquireVsCodeApi();
+    const vscode = acquireVsCodeApi();
 
-      const logEl = document.getElementById('log');
-      const hintEl = document.getElementById('hint');
-      const retryBtn = document.getElementById('retry');
-      const closeBtn = document.getElementById('close');
+    const attemptEl = document.getElementById('attempt');
+    const logEl = document.getElementById('log');
+    const hintEl = document.getElementById('hint');
 
-      window.addEventListener('message', (event) => {
-        const msg = event.data;
-        if (msg?.command === 'updateLog') {
-          logEl.textContent = msg.log || '';
-        }
-      });
+    document.getElementById('retry').addEventListener('click', () => {
+      vscode.postMessage({ command: 'retry', hint: hintEl.value });
+    });
+    document.getElementById('close').addEventListener('click', () => {
+      vscode.postMessage({ command: 'close' });
+    });
 
-      retryBtn.addEventListener('click', () => {
-        const hint = hintEl.value;
-        vscode.postMessage({ command: 'retry', hint });
-      });
+    // Copy helpers
+    document.getElementById('copyAttempt').addEventListener('click', async () => {
+      try { await navigator.clipboard.writeText(attemptEl.textContent || ''); } catch {}
+    });
+    document.getElementById('copyError').addEventListener('click', async () => {
+      try { await navigator.clipboard.writeText(logEl.textContent || ''); } catch {}
+    });
 
-      closeBtn.addEventListener('click', () => {
-        vscode.postMessage({ command: 'close' });
-      });
-    `;
-    const html = `
-      <!DOCTYPE html>
-      <html>
-      <head>
-        <meta charset="UTF-8" />
-        <style>${css}</style>
-        <title>Lean4 Copilot \u2014 Verification Log</title>
-      </head>
-      <body>
-        <h2>Lean4 Copilot \u2014 Verification Log</h2>
-        <div class="box"><pre id="log">${escapeHtml(logText)}</pre></div>
+    // Live updates from extension
+    window.addEventListener('message', (event) => {
+      const msg = event.data;
+      if (msg?.command === 'updateError') {
+        attemptEl.textContent = msg.attempt || '';
+        logEl.textContent = msg.log || '';
+      }
+    });
+  `;
+    const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    return `
+  <!doctype html>
+  <html>
+    <head>
+      <meta charset="utf-8"/>
+      <title>Lean4 Copilot \u2014 Verification Log</title>
+      <style>${css}</style>
+    </head>
+    <body>
+      <h2>Lean4 Copilot \u2014 Verification Log</h2>
 
-        <div class="row" style="flex-direction: column; align-items: stretch;">
-          <label class="hintlabel" for="hint">Retry with hint (optional):</label>
-        <textarea id="hint" placeholder="e.g., try using &grave;simp: any&grave; then &grave;rfl&grave;, or rewrite using lemma XYZ"></textarea>
-</div>
+      <div class="grid">
+        <!-- Model attempt -->
+        <section class="card">
+          <div class="card-title">Model attempt</div>
+          <pre id="attempt" class="mono">${esc(attemptText)}</pre>
+          <div class="row-actions">
+            <button id="copyAttempt" title="Copy attempt">Copy</button>
+          </div>
+        </section>
 
-        <div class="row">
+        <!-- Lean error -->
+        <section class="card">
+          <div class="card-title">Lean error</div>
+          <pre id="log" class="mono">${esc(
+      logText || "Verification failed."
+    )}</pre>
+          <div class="row-actions">
+            <button id="copyError" title="Copy error">Copy</button>
+          </div>
+        </section>
+      </div>
+
+      <section class="card" style="margin-top:12px;">
+        <div class="card-title">Retry with hint <span class="muted">(optional)</span></div>
+        <div class="input-block">
+          <textarea id="hint" placeholder="e.g., try 'simp' then 'rfl', or rewrite using lemma XYZ"></textarea>
+        </div>
+        <div class="actions">
           <button id="retry">Retry</button>
           <button id="close">Close</button>
         </div>
+      </section>
 
-        <script>${js}</script>
-      </body>
-      </html>
-    `;
-    return html;
+      <script>${js}</script>
+    </body>
+  </html>`;
   }
 };
-function escapeHtml(s) {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
 
 // src/extension.ts
+var EXT_CTX;
+var ProposedContentProvider = class {
+  emitter = new vscode2.EventEmitter();
+  onDidChange = this.emitter.event;
+  store = /* @__PURE__ */ new Map();
+  set(uri, text) {
+    this.store.set(uri.toString(), text);
+    this.emitter.fire(uri);
+  }
+  has(uri) {
+    return this.store.has(uri.toString());
+  }
+  clear(uri) {
+    this.store.delete(uri.toString());
+    this.emitter.fire(uri);
+  }
+  provideTextDocumentContent(uri) {
+    return this.store.get(uri.toString()) ?? "";
+  }
+};
+var SCHEME = "lean4copilot";
+var provider;
+var proposals = /* @__PURE__ */ new Map();
+var acceptBtn;
+var discardBtn;
 function activate(context) {
+  EXT_CTX = context;
+  ErrorPanel.init(context);
+  provider = new ProposedContentProvider();
+  context.subscriptions.push(
+    vscode2.workspace.registerTextDocumentContentProvider(SCHEME, provider)
+  );
+  acceptBtn = vscode2.window.createStatusBarItem(
+    vscode2.StatusBarAlignment.Right,
+    100
+  );
+  acceptBtn.text = "$(check) Accept Copilot";
+  acceptBtn.tooltip = "Apply the proposed Copilot changes";
+  acceptBtn.command = "lean4Copilot.applyProposed";
+  acceptBtn.hide();
+  discardBtn = vscode2.window.createStatusBarItem(
+    vscode2.StatusBarAlignment.Right,
+    99
+  );
+  discardBtn.text = "$(close) Discard Copilot";
+  discardBtn.tooltip = "Discard the proposed Copilot changes";
+  discardBtn.command = "lean4Copilot.discardProposed";
+  discardBtn.hide();
+  context.subscriptions.push(acceptBtn, discardBtn);
+  context.subscriptions.push(
+    vscode2.commands.registerCommand(
+      "lean4Copilot.applyProposed",
+      applyCurrentProposal
+    ),
+    vscode2.commands.registerCommand(
+      "lean4Copilot.discardProposed",
+      discardCurrentProposal
+    )
+  );
+  const inlineCmd = vscode2.commands.registerCommand(
+    "lean4Copilot.inlineSuggest",
+    async () => {
+      const editor = vscode2.window.activeTextEditor;
+      if (!editor || editor.document.uri.scheme === SCHEME) {
+        vscode2.window.showInformationMessage(
+          "Open a Lean file to use Ghost Suggest."
+        );
+        return;
+      }
+      await vscode2.commands.executeCommand(
+        "editor.action.inlineSuggest.trigger"
+      );
+    }
+  );
+  context.subscriptions.push(inlineCmd);
   const inlineProvider = vscode2.languages.registerInlineCompletionItemProvider(
     { language: "lean4" },
     new GhostInlineProvider()
   );
+  context.subscriptions.push(inlineProvider);
   const completeCmd = vscode2.commands.registerCommand(
     "lean4Copilot.completeProof",
-    () => handleCompleteProof(context)
+    () => handleCompleteProof()
   );
-  const ghostCmd = vscode2.commands.registerCommand(
-    "lean4Copilot.inlineSuggest",
-    () => {
-      vscode2.window.setStatusBarMessage(
-        "Lean4 Copilot inline suggestions are active.",
-        2e3
-      );
-    }
+  context.subscriptions.push(completeCmd);
+  context.subscriptions.push(
+    vscode2.window.onDidChangeActiveTextEditor(updateStatusButtons),
+    vscode2.workspace.onDidCloseTextDocument(updateStatusButtons)
   );
-  context.subscriptions.push(inlineProvider, completeCmd, ghostCmd);
-  ErrorPanel.init(context);
+}
+function deactivate() {
 }
 var GhostInlineProvider = class {
-  // Prevent spamming backend: cache last request by doc+pos+version
   lastKey = null;
   lastSuggestion = null;
-  async provideInlineCompletionItems(document, position, _context, _token) {
+  async provideInlineCompletionItems(document, position) {
     try {
+      if (document.uri.scheme === SCHEME) return null;
       const key = `${document.uri.toString()}@${document.version}:${position.line}:${position.character}`;
-      if (this.lastKey === key && this.lastSuggestion) {
+      if (this.lastKey === key && this.lastSuggestion)
         return listFor(position, this.lastSuggestion);
-      }
       const fileText = document.getText();
       const { suggestion } = await suggestLine(
         fileText,
@@ -369,13 +553,9 @@ var GhostInlineProvider = class {
         this.lastSuggestion = null;
         return null;
       }
-      const ghost = cleanSuggestion(suggestion);
-      if (!ghost) {
-        return null;
-      }
       this.lastKey = key;
       this.lastSuggestion = suggestion;
-      return listFor(position, ghost);
+      return listFor(position, suggestion);
     } catch {
       return null;
     }
@@ -383,94 +563,96 @@ var GhostInlineProvider = class {
 };
 function listFor(pos, text) {
   const range = new vscode2.Range(pos, pos);
-  const item = new vscode2.InlineCompletionItem(text, range);
-  return { items: [item] };
+  return { items: [new vscode2.InlineCompletionItem(text, range)] };
 }
-async function handleCompleteProof(context) {
+async function handleCompleteProof() {
   const editor = vscode2.window.activeTextEditor;
   if (!editor) {
-    vscode2.window.showWarningMessage("No active editor.");
+    vscode2.window.showWarningMessage("Lean4 Copilot: No active editor.");
     return;
   }
   const doc = editor.document;
   const originalText = doc.getText();
-  const progressTitle = "Lean4 Copilot: Completing proof\u2026";
-  const result = await vscode2.window.withProgress(
-    { location: vscode2.ProgressLocation.Notification, title: progressTitle },
-    async () => {
-      try {
-        const res = await completeProof(originalText);
-        if (!res.ok) {
-          ErrorPanel.show(context, res.log ?? "Verification failed.");
-          return { ok: false, proof: res.proof, log: res.log ?? "" };
-        }
-        return { ok: true, proof: res.proof, log: "" };
-      } catch (e) {
-        const msg = e?.message ?? String(e);
-        ErrorPanel.show(context, `Backend error: ${msg}`);
-        return { ok: false, proof: originalText, log: msg };
-      }
+  try {
+    const res = await vscode2.window.withProgress(
+      {
+        location: vscode2.ProgressLocation.Notification,
+        title: "Lean4 Copilot: Completing proof\u2026"
+      },
+      () => completeProof(originalText)
+    );
+    if (!res.ok) {
+      ErrorPanel.show(
+        EXT_CTX,
+        res.log ?? "Verification failed.",
+        doc.uri,
+        res.attempt ?? ""
+      );
+      return;
     }
-  );
-  if (!result.ok) return;
-  const tempDoc = await vscode2.workspace.openTextDocument({
-    content: result.proof,
-    language: doc.languageId || "lean4"
+    await showProposedDiff(doc, res.proof);
+  } catch (e) {
+    ErrorPanel.show(EXT_CTX, `Backend error: ${e?.message ?? String(e)}`);
+  }
+}
+async function showProposedDiff(originalDoc, proposedText) {
+  const base = originalDoc.uri.path.split("/").pop() || "Untitled.lean";
+  const proposedUri = vscode2.Uri.parse(`${SCHEME}:${base}?t=${Date.now()}`);
+  provider.set(proposedUri, proposedText);
+  proposals.set(proposedUri.toString(), {
+    original: originalDoc.uri,
+    text: proposedText
   });
-  await vscode2.window.showTextDocument(tempDoc, {
-    preview: true,
-    preserveFocus: true
-  });
-  const title = "Lean4 Copilot: Proposed changes";
   await vscode2.commands.executeCommand(
     "vscode.diff",
-    doc.uri,
-    tempDoc.uri,
-    title,
-    { preview: true }
+    originalDoc.uri,
+    proposedUri,
+    "Lean4 Copilot: Proposed changes",
+    {
+      preview: true,
+      viewColumn: vscode2.ViewColumn.Beside,
+      preserveFocus: false
+    }
   );
-  const action = await vscode2.window.showInformationMessage(
-    "Apply Lean4 Copilot changes?",
-    { modal: true },
-    "Apply",
-    "Discard"
-  );
-  if (action === "Apply") {
-    await applyFullDocumentEdit(doc, result.proof);
-    await closeActiveEditorIfDiff();
-    await focusAndCloseDoc(tempDoc.uri);
-    vscode2.window.setStatusBarMessage("Lean4 Copilot: Applied.", 2e3);
-  } else {
-    await closeActiveEditorIfDiff();
-    await focusAndCloseDoc(tempDoc.uri);
-    vscode2.window.setStatusBarMessage("Lean4 Copilot: Discarded.", 2e3);
-  }
+  updateStatusButtons();
 }
-async function applyFullDocumentEdit(doc, newText) {
+async function applyCurrentProposal() {
+  const active = vscode2.window.activeTextEditor?.document;
+  if (!active || active.uri.scheme !== SCHEME) return;
+  const rec = proposals.get(active.uri.toString());
+  if (!rec) return;
+  const targetDoc = await vscode2.workspace.openTextDocument(rec.original);
+  const edit = new vscode2.WorkspaceEdit();
   const fullRange = new vscode2.Range(
-    doc.positionAt(0),
-    doc.positionAt(doc.getText().length)
+    targetDoc.positionAt(0),
+    targetDoc.positionAt(targetDoc.getText().length)
   );
-  const editor = await vscode2.window.showTextDocument(doc, { preview: false });
-  await editor.edit((eb) => eb.replace(fullRange, newText));
-}
-async function closeActiveEditorIfDiff() {
+  edit.replace(rec.original, fullRange, rec.text);
+  await vscode2.workspace.applyEdit(edit);
+  provider.clear(active.uri);
+  proposals.delete(active.uri.toString());
   await vscode2.commands.executeCommand("workbench.action.closeActiveEditor");
+  updateStatusButtons();
+  vscode2.window.setStatusBarMessage("Lean4 Copilot: Applied.", 2e3);
 }
-async function focusAndCloseDoc(uri) {
-  const doc = vscode2.workspace.textDocuments.find(
-    (d) => d.uri.toString() === uri.toString()
-  );
-  if (!doc) return;
-  const editor = vscode2.window.visibleTextEditors.find(
-    (e) => e.document === doc
-  );
-  if (editor) {
-    await vscode2.window.showTextDocument(editor.document, editor.viewColumn);
-    await vscode2.commands.executeCommand("workbench.action.closeActiveEditor");
+async function discardCurrentProposal() {
+  const proposedDoc = vscode2.window.activeTextEditor?.document;
+  if (!proposedDoc || proposedDoc.uri.scheme !== SCHEME) return;
+  provider.clear(proposedDoc.uri);
+  proposals.delete(proposedDoc.uri.toString());
+  await vscode2.commands.executeCommand("workbench.action.closeActiveEditor");
+  updateStatusButtons();
+  vscode2.window.setStatusBarMessage("Lean4 Copilot: Discarded.", 2e3);
+}
+function updateStatusButtons() {
+  const isProposal = vscode2.window.activeTextEditor?.document.uri.scheme === SCHEME;
+  if (isProposal) {
+    acceptBtn.show();
+    discardBtn.show();
+  } else {
+    acceptBtn.hide();
+    discardBtn.hide();
   }
-}
-function deactivate() {
 }
 // Annotate the CommonJS export names for ESM import in node:
 0 && (module.exports = {

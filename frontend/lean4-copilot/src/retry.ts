@@ -1,5 +1,5 @@
 // src/retry.ts
-import { completeProof } from "./api";
+import { completeProof, CompleteResult } from "./api";
 
 export type RetryResult = {
   ok: boolean;
@@ -14,11 +14,13 @@ export type RetryResult = {
 export async function retryWithHint(
   fileText: string,
   userHint?: string
-): Promise<RetryResult> {
+): Promise<CompleteResult> {
   const res = await completeProof(fileText, userHint);
   return {
     ok: res.ok,
     proof: res.proof,
     log: res.log ?? "",
+    attempt: res.attempt ?? null, // ⬅️ keep null if absent
+    candidates: res.candidates,
   };
 }

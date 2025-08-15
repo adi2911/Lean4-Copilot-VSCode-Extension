@@ -8,22 +8,15 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 # ── Resilient imports (works for both flat and package layouts) ───────────────
-try:
+
     # typical layout: backend/app/services/*
-    from services.langchain_pipeline import (
+from app.services.langchain_pipeline import (
         SUGGEST_PIPELINE,
         RETRY_PIPELINE,
         COMPLETE_PIPELINE,
     )
-    from services.lean_verify import verify_lean_code
-except Exception:
-    # fallback if services/ is sibling to this file
-    from langchain_pipeline import (
-        SUGGEST_PIPELINE,
-        RETRY_PIPELINE,
-        COMPLETE_PIPELINE,
-    )  # type: ignore
-    from lean_verify import verify_lean_code  # type: ignore
+from app.services.lean_verify import verify_lean_code
+
 
 try:
     from . import schemas  # if this file is part of a package

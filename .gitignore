@@ -4,3 +4,6 @@ node_modules
 videos
 .env
 research_paper/*
+out
+html
+assets
